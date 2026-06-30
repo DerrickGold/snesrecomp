@@ -48,6 +48,7 @@ class Insn:
     __slots__ = ('addr', 'opcode', 'mnem', 'mode', 'operand', 'length',
                  'dispatch_entries', 'dispatch_kind', 'dispatch_idx_reg',
                  'dispatch_table_bases', 'm_flag', 'x_flag', 'dispatch_terminal',
+                 'dispatch_ret',
                  'const_z_fold_unconditional', 'const_z_fold_dead_pc24')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
@@ -68,6 +69,10 @@ class Insn:
         # where the index register is already a logical entry index.
         self.dispatch_table_bases = ()
         self.dispatch_terminal = False
+        # For a PHA/RTS jump-table that is a CALL (a return addr was pushed
+        # before the handler addr): the in-function 16-bit continuation the
+        # handlers RTS back to. None = terminal tail-call (default).
+        self.dispatch_ret = None
         self.m_flag = 1
         self.x_flag = 1
         # Constant-Z branch fold: when set on a BEQ/BNE, the preceding

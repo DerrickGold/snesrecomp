@@ -395,7 +395,17 @@ void rtl_accumulate_apu_catchup(void) {
 }
 
 void RtlApuWrite(uint16 adr, uint8 val) {
-  assert(adr >= APUI00 && adr <= APUI03);
+  /* An out-of-range adr here means corrupted state upstream reached a bogus
+   * register write (seen during the post-act transition's bad NMI DMA). Don't
+   * hard-abort — that masks the real fault and prevents the diagnostic dump.
+   * Log once and ignore so the run limps far enough to capture state. */
+  if (adr < APUI00 || adr > APUI03) {
+    static int warned;
+    if (!warned) { warned = 1;
+      fprintf(stderr, "[apu] WARN RtlApuWrite out-of-range adr=$%04x val=%02x (upstream corruption) — ignoring\n", adr, val);
+    }
+    return;
+  }
   // Catch the APU up to the current cycle, then SCHEDULE the port write
   // in APU-sample time rather than mutating inPorts at wall time.
   //
@@ -415,6 +425,14 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
   audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
+  if (getenv("AR_APULOG") && (adr & 0xfc) == 0x40) {
+    extern int snes_frame_counter;
+    fprintf(stderr, "[apu] f=%d WRITE $21%02x <- %02x  (spc.pc=%04x in=%02x%02x%02x%02x out=%02x%02x%02x%02x)\n",
+            snes_frame_counter, (unsigned)(adr & 0xff), val,
+            g_snes->apu->spc->pc,
+            g_snes->apu->inPorts[0], g_snes->apu->inPorts[1], g_snes->apu->inPorts[2], g_snes->apu->inPorts[3],
+            g_snes->apu->outPorts[0], g_snes->apu->outPorts[1], g_snes->apu->outPorts[2], g_snes->apu->outPorts[3]);
+  }
   {
     /* Write clock: each target advances from the PREVIOUS write's target
      * by the real wall-time gap between the two writes, converted to
@@ -497,15 +515,63 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   RtlApuUnlock();
 }
 
+/* ActRaiser's SPC-uploader ($02:9964 / $02:9A56) reads the block-stream
+ * source through `LDA [$A5],Y` — i.e. the 24-bit source pointer lives at
+ * direct-page offset $A5/$A6/$A7, NOT at DP+0 (the SMW convention this HLE
+ * was first written for). Reading DP+0 fetched all-zero garbage, so the
+ * parser walked $FF-filled ROM, reported a bogus entry of $0000, and the
+ * `final_pc != 0` guard then left the SPC PC unset; the SPC ran off into
+ * uninitialised ARAM, hit a STOP ($FF) opcode, and halted at boot — no
+ * audio ever, and the boss-music handshake at $00:A410 (poll $2140 for the
+ * SPC to echo $F1) spun forever -> watchdog. The stream format itself is
+ * identical (length/target/data ... 0/entry), so only the pointer offset
+ * differs. */
+#define AR_SPC_UPLOAD_DP_PTR 0xA5
+
+/* Set by the HLE upload when the engine's resident ARAM uploader needs to be
+ * completed but the engine hasn't entered it yet; cleared once completed. See
+ * RtlUploadSpcImageFromDpInternal and ar_uploader_complete_tick. */
+int g_ar_uploader_complete_pending = 0;
+
+/* Finish the engine's resident uploader the moment it enters the $CC-wait, for
+ * the deferred case where the CPU's $9A56 (HLEd) ran before the engine got
+ * there. Called once per host frame from the main loop. Jumps to the uploader
+ * tail at $0F48 (clear ports, enable timer0, RET), exactly as a real transfer
+ * ends — leaving the engine in the correct post-upload state. */
+void ar_uploader_complete_tick(void) {
+  if (!g_ar_uploader_complete_pending) return;
+  RtlApuLock();
+  Spc *spc = g_snes->apu->spc;
+  const uint8_t *ar = g_snes->apu->ram;
+  if (spc->pc >= 0x0F0E && spc->pc <= 0x0F18 &&
+      ar[0x0F48] == 0xCD && ar[0x0F49] == 0x31 && ar[0x0F4A] == 0xD8 &&
+      ar[0x0F4B] == 0xF1 && ar[0x0F4C] == 0x6F) {
+    spc->pc = 0x0F48;
+    g_ar_uploader_complete_pending = 0;
+    if (getenv("AR_APULOG")) {
+      extern int snes_frame_counter;
+      fprintf(stderr, "[apu] f=%d UPLOAD(deferred): completed resident uploader -> $0F48 RET\n",
+              snes_frame_counter);
+    }
+  }
+  RtlApuUnlock();
+}
+
 static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_result) {
-  uint16_t dp = cpu->D;
+  uint16_t dp = (cpu->D + AR_SPC_UPLOAD_DP_PTR) & 0xffff;
   uint16_t data_lo = (uint16_t)g_ram[(dp + 0) & 0xffff]
                    | ((uint16_t)g_ram[(dp + 1) & 0xffff] << 8);
   uint8_t data_bank = g_ram[(dp + 2) & 0xffff];
+  if (getenv("AR_APULOG")) {
+    extern int snes_frame_counter;
+    fprintf(stderr, "[apu] f=%d HLE-ENTRY D=%04x src=%02x:%04x\n",
+            snes_frame_counter, cpu->D, data_bank, data_lo);
+  }
   const uint8_t *p = RomPtr(((uint32_t)data_bank << 16) | data_lo);
   uint16_t final_pc = 0;
   int block_count = 0;
 
+  bool ulog = getenv("AR_APULOG") != NULL;
   RtlApuLock();
   for (;;) {
     uint16_t n = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -515,6 +581,9 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
       final_pc = target;
       break;
     }
+    if (ulog && block_count < 16)
+      fprintf(stderr, "[apu]   block %d: target=%04x n=%u firstbytes=%02x %02x %02x\n",
+              block_count, target, n, p[0], n>1?p[1]:0, n>2?p[2]:0);
     for (uint16_t i = 0; i < n; i++)
       g_snes->apu->ram[(uint16_t)(target + i)] = p[i];
     p += n;
@@ -547,6 +616,12 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
    * Detect "first upload" via apu->romReadable: it's reset to true by
    * apu_reset() and only flipped false here, so on the IPL-phase
    * upload it's still true. */
+  if (getenv("AR_APULOG")) {
+    extern int snes_frame_counter;
+    fprintf(stderr, "[apu] f=%d UPLOAD blocks=%d final_pc=%04x src=%02x:%04x ipl=%d (spc.pc was %04x stopped=%d)\n",
+            snes_frame_counter, block_count, final_pc, data_bank, data_lo,
+            (int)g_snes->apu->romReadable, g_snes->apu->spc->pc, (int)g_snes->apu->spc->stopped);
+  }
   bool ipl_phase = g_snes->apu->romReadable;
   /* The upload supersedes any not-yet-applied scheduled port writes;
    * a stale pre-upload command landing on the freshly cleared ports
@@ -566,6 +641,48 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
         g_snes->apu->spc->sp = 0xef;
       g_snes->apu->spc->pc = final_pc;
     }
+  } else {
+    /* Subsequent upload: ActRaiser's resident SPC engine handles these via its
+     * OWN IPL-style uploader in ARAM at $0F0E — it CALLs in, raises the $AABB
+     * ready signature, and spins at $0F12 (`MOV A,$F4; CMP #$CC; BNE`) waiting
+     * for the CPU to send $CC and stream the block image. We bypass that by
+     * memcpying the image straight into apu->ram (running the CPU-side $9A56
+     * natively over-clocks the SPC and breaks boot), so the $CC stream is never
+     * sent and the engine stays parked at $0F12 — it has, since the first music
+     * upload. A later play-command handshake ($00:A410 sends $F1 and spins for
+     * the echo, $A427 waits for the port to clear) then can't be serviced: at
+     * worst a 5 s watchdog/SIGSEGV, at best the engine escapes but mis-handles
+     * the sequence (echoes commands instead of acking), so the boss never gets
+     * its go-signal. Complete the uploader for it, here at upload time (before
+     * any play command exists, so the finalize's port-clear is correct): jump
+     * the SPC to its tail at $0F48 (`MOV X,#$31; MOV $F1,X; RET` — clears ports,
+     * enables timer0, returns to the engine main loop), exactly as a real $CC
+     * transfer would end. Guarded on the actual opcodes + the engine being in
+     * the wait, so a different resident driver or non-uploader state is left
+     * untouched. */
+    Spc *spc = g_snes->apu->spc;
+    const uint8_t *ar = g_snes->apu->ram;
+    int uploader_present =
+        (ar[0x0F48] == 0xCD && ar[0x0F49] == 0x31 && ar[0x0F4A] == 0xD8 &&
+         ar[0x0F4B] == 0xF1 && ar[0x0F4C] == 0x6F);
+    if (uploader_present && spc->pc >= 0x0F0E && spc->pc <= 0x0F18) {
+      /* Engine already parked in the uploader (the normal ordering: it CALLs
+       * in, then the CPU's $9A56 — which we are HLEing — streams). Finish it. */
+      spc->pc = 0x0F48;
+      g_ar_uploader_complete_pending = 0;
+      if (getenv("AR_APULOG")) {
+        extern int snes_frame_counter;
+        fprintf(stderr, "[apu] f=%d UPLOAD: completed resident uploader -> $0F48 RET\n",
+                snes_frame_counter);
+      }
+    } else if (uploader_present) {
+      /* The CPU reached $9A56 before the engine entered the uploader (happens
+       * when the game thread outruns the SPC, e.g. uncapped/headless). Defer:
+       * ar_uploader_complete_tick() (called per frame) finishes it the moment
+       * the engine arrives — still well before any play-command handshake, so
+       * the finalize's port-clear stays harmless. */
+      g_ar_uploader_complete_pending = 1;
+    }
   }
   g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   RtlApuUnlock();
@@ -582,7 +699,23 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
 }
 
 bool RtlUploadSpcImageFromDp(CpuState *cpu) {
-  return RtlUploadSpcImageFromDpInternal(cpu, false);
+  bool ok = RtlUploadSpcImageFromDpInternal(cpu, false);
+  /* The emitted hle_spc_upload wrapper has NO `RTL`/`RTS`, so unlike a real
+   * recompiled function it never removes the return frame the call site pushed
+   * onto cpu->S — leaking it every call. Harmless at top level (SP resets each
+   * frame) but fatal inside the object loop (e.g. the boss-music handler's
+   * `PHX; JSL $9964; PLX; RTS`: the leak shifts PLX/RTS -> garbage return ->
+   * scribbled $D0-$D5 DMA descriptor -> bad NMI DMA from $2100 -> crash).
+   * Pop the matching frame size — and the two routines differ in convention:
+   *   $9964 is reached only via JSL (3-byte frame, RTL)   -> pop 3
+   *   $9A56 is reached only via same-bank JSR (2-byte, RTS) -> pop 2
+   * (verified: 0 `JSL $029A56` sites, 0 `JSR $9964` sites). Popping a blanket 3
+   * over-popped $9A56 by 1 byte/call -> stack drift -> SIGSEGV in normal play.
+   * Distinguish via g_last_recomp_func, which the wrapper set at entry. */
+  extern const char *g_last_recomp_func;
+  int pop = (g_last_recomp_func && strstr(g_last_recomp_func, "9A56")) ? 2 : 3;
+  cpu->S = (uint16_t)(cpu->S + pop);
+  return ok;
 }
 
 bool RtlHandleSpcUpload(CpuState *cpu) {
@@ -623,6 +756,31 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   #undef DSP_AVAIL
   RtlApuLock();
   dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
+  /* AR_AUDIODBG: report DSP master volume / mute / peak sample so we can tell
+   * whether the engine is producing sound at all (silence = engine not playing
+   * vs DSP muted/zero-volume vs samples lost downstream). */
+  if (getenv("AR_AUDIODBG")) {
+    extern uint64_t snes_apu_cycle_count(void);
+    static int n; static uint64_t last_cyc; static uint64_t last_ms;
+    extern uint64_t audio_trace_wall_ms(void);
+    if ((n++ % 60) == 0) {
+      int16 pk = 0;
+      for (int i = 0; i < samples * 2; i++) {
+        int16 s = audio_buffer[i]; if (s < 0) s = -s; if (s > pk) pk = s;
+      }
+      Dsp *d = g_snes->apu->dsp;
+      uint64_t cyc = snes_apu_cycle_count(), ms = audio_trace_wall_ms();
+      uint64_t dcyc = cyc - last_cyc, dms = ms - last_ms;
+      /* SPC should run ~1024 cycles/ms (1.024 MHz). cyc/ms far below that =
+       * under-cycled engine (slow music/handshakes); count keyed-on voices. */
+      int kon = 0; for (int v = 0; v < 8; v++) if (d->channel[v].keyOn || d->channel[v].keyOff==false ) kon += (d->channel[v].keyOn?1:0);
+      fprintf(stderr, "[audiodbg] mvol=%d mute=%d peak=%d | SPC %llu cyc/%llu ms = %llu cyc/ms (want ~1024) konPend=%d\n",
+              d->masterVolumeL, (int)d->mute, pk,
+              (unsigned long long)dcyc, (unsigned long long)dms,
+              dms ? (unsigned long long)(dcyc/dms) : 0ull, kon);
+      last_cyc = cyc; last_ms = ms;
+    }
+  }
   /* Mix MSU-1 streaming audio on top of the S-DSP block. Inert (no-op)
    * unless a pack is armed and a track is playing. Runs under the APU
    * lock we already hold, which serialises it against MSU register

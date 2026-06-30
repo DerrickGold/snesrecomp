@@ -148,6 +148,17 @@ typedef enum RecompReturn {
     RECOMP_RETURN_SKIP_1 = 1,
     RECOMP_RETURN_SKIP_2 = 2,
     RECOMP_RETURN_SKIP_3 = 3,
+    /* Trampoline sentinel: a DISPATCHED frame (host_return_valid==0, i.e.
+     * running inside a cpu_dispatch_pc_from driving loop) returns this in place
+     * of recursively calling cpu_dispatch_pc_from for a computed-jump tail-
+     * dispatch. It stashes the next target via cpu_tailcall_request() and the
+     * loop iterates flat instead of nesting the C stack once per computed jump.
+     * Without it, a long RAM-pointer dispatch loop (ActRaiser's $8915 object
+     * loop nesting $8966) grows the 64-deep recomp stack to overflow and emits
+     * a giant SKIP_N that over-unwinds past its JSR caller. Value is far above
+     * any real SKIP_N (bounded by RECOMP_STACK_DEPTH=64) and is consumed only
+     * by the driving loop, so it never reaches a skip-propagation site. */
+    RECOMP_RETURN_TAILCALL = 0x4000,
 } RecompReturn;
 
 /* ── Typed register access ────────────────────────────────────────────────
@@ -320,6 +331,28 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr);
 void   cpu_write8 (CpuState *cpu, uint8 bank, uint16 addr, uint8  v);
 void   cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
 
+/* Direct-page / stack POINTER fetch: a 16-bit read whose two bytes are
+ * confined to bank $00 — the high byte wraps within the bank
+ * (addr $FFFF -> $0000), it does NOT cross into bank $01. This is the
+ * native-mode 65816 rule for the indirect-addressing pointer fetch and
+ * differs from cpu_read16, which is used for the final DATA access and
+ * DOES cross the bank boundary. Using cpu_read16 for the pointer fetch
+ * mis-read the high byte when (D+dp) or (S+sr) landed at $00:FFFF.
+ * Verified vs Harte 65816 vectors. */
+static inline uint16 cpu_read16_dp(CpuState *cpu, uint16 addr) {
+    uint8 lo = cpu_read8(cpu, 0x00, addr);
+    uint8 hi = cpu_read8(cpu, 0x00, (uint16)(addr + 1));
+    return (uint16)((uint16)lo | ((uint16)hi << 8));
+}
+
+/* Software-interrupt (BRK/COP) hooks. Generated code calls these at a BRK/COP
+ * site to model the vector handler's effect, then FALLS THROUGH to PC+2 (the
+ * handler RTIs there). The game installs a hook replicating its BRK/COP handler
+ * (e.g. ActRaiser's BRK handler stores A -> $035B, the sound-request port).
+ * NULL when the game doesn't use them — then BRK/COP is an effect-free continue. */
+extern void (*g_cpu_brk_hook)(CpuState *cpu);
+extern void (*g_cpu_cop_hook)(CpuState *cpu);
+
 /* ── Interrupt-frame ABI (Option-1 cpu->S model) ────────────────────────── */
 
 /* Model the 65816 hardware interrupt-entry push so a handler invoked via a
@@ -384,6 +417,35 @@ extern CpuState g_cpu;
 
 /* Diagnostic — generated functions can call this to log entry. */
 void cpu_dbg_funcname(const char *name);
+
+/* ── Entry m/x invariant check (AR_MXCHECK) ───────────────────────────
+ * Each generated variant bank_XX_PC_MmXn was emitted ASSUMING entry
+ * m=m,x=n. Dispatched calls always match (the dispatch switch picks the
+ * variant by runtime flags), so a mismatch can only happen on a DIRECT
+ * call, where the emitter's STATIC m/x analysis chose the variant — i.e.
+ * a mismatch means that analysis was wrong (the recurring "m/x leak /
+ * wrong-variant" bug class), caught at the exact call site. Opt-in via
+ * AR_MXCHECK=1; near-free when off (one global load + predicted branch).
+ * Logs (rate-limited) and continues — never aborts — so a playthrough
+ * surfaces the whole cluster of sites in one run. */
+extern int g_ar_mx_check;  /* set once from AR_MXCHECK env */
+extern int g_ar_mxhist;    /* set once from AR_MXHIST env */
+extern const char *g_ar_trapfn; /* AR_TRAPFN substring; dump call stack on entry */
+void ar_entry_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32 pc24);
+void ar_mxhist_record(uint32 pc24, int m, int x);
+void ar_mxhist_dump(void);
+void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32 pc24);
+void ar_garbage_variant_trap(CpuState *cpu, const char *fn, uint32 pc24);
+static inline void ar_entry_mx_check(CpuState *cpu, int em, int ex,
+                                     const char *fn, uint32 pc24) {
+  if (g_ar_mx_check
+      && (((cpu->m_flag & 1) != em) || ((cpu->x_flag & 1) != ex)))
+    ar_entry_mx_fail(cpu, em, ex, fn, pc24);
+  if (g_ar_mxhist)
+    ar_mxhist_record(pc24, cpu->m_flag & 1, cpu->x_flag & 1);
+  if (g_ar_trapfn)
+    ar_entry_trapfn(cpu, fn, pc24);
+}
 
 /* ── PEI-trampoline dispatch (2026-05-24, narrow detector) ─────────────
  *

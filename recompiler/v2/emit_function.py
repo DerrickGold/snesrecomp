@@ -57,6 +57,45 @@ def _variant_suffix(m: int, x: int) -> str:
     return f"_M{m & 1}X{x & 1}"
 
 
+def _detect_garbage_variant(rom, bank, start, entry_m, entry_x, graph, end):
+    """Return the PC of a split-immediate BRK if this (entry_m, entry_x) variant
+    is a MISDECODE, else None.
+
+    Signature: a `BRK` at PC P that a VALID sibling variant (opposite m OR
+    opposite x) decodes as MID-INSTRUCTION — i.e. P is the high byte of a 16-bit
+    immediate the narrow decode split (`LDA #$0007` at m=0 vs `LDA #$07`+`BRK` at
+    m=1). Such a variant is never legitimately reached. Cross-variant comparison,
+    decode-cached → cheap and conservative.
+
+    Guards: only runs once the prune map exists (else a sibling might be an
+    unreachable garbage decode); only compares against siblings that are actually
+    VALID/reachable. Known limitation: a real `LDA #id; BRK` syscall reached at
+    BOTH m would over-flag the m=1 variant — rare, and the runtime trap is
+    non-fatal + deduped, so a stray hit is a cheap log, not a crash."""
+    from v2.codegen import have_valid_variants, valid_variant_list
+    if not have_valid_variants():
+        return None
+    brk_pcs = [k.pc & 0xFFFF for k, di in graph.insns.items()
+               if di.insn.mnem == 'BRK']
+    if not brk_pcs:
+        return None
+    valid = set(valid_variant_list(addr24(bank, start)))
+    for sm, sx in ((entry_m ^ 1, entry_x), (entry_m, entry_x ^ 1)):
+        if (sm & 1, sx & 1) not in valid:
+            continue
+        try:
+            sg = decode_function(rom, bank, start, sm & 1, sx & 1, end=end)
+        except Exception:
+            continue
+        for k2, di2 in sg.insns.items():
+            q = k2.pc & 0xFFFF
+            length = getattr(di2.insn, 'length', 0) or 0
+            for p in brk_pcs:
+                if q < p < q + length:      # P strictly inside a sibling insn
+                    return p
+    return None
+
+
 def _stack_width_for_a(insn) -> int:
     return 1 if (getattr(insn, 'm_flag', 1) & 1) else 2
 
@@ -470,6 +509,15 @@ def emit_function(rom: bytes, bank: int, start: int,
                             callee_exit_mx=callee_exit_mx,
                             callee_exit_mx_modes=callee_exit_mx_modes,
                             sibling_entry_pcs=sibling_entry_pcs)
+    # Garbage-variant detection: a split-immediate MISDECODE. If this variant
+    # decodes a BRK at a PC that a VALID sibling variant (opposite m or x) spans
+    # mid-instruction, the BRK is the high byte of a 16-bit immediate the narrow
+    # decode split off (e.g. m=0 `LDA #$0007` -> m=1 `LDA #$07`+`BRK`). Such a
+    # variant is never legitimately reached; the runtime trap (emitted in the
+    # prologue below) fires the instant a leaked flag dispatches into it — closer
+    # to the misdecode root than the downstream crash, no oracle needed.
+    _garbage_brk_pc = _detect_garbage_variant(
+        rom, bank, start, entry_m, entry_x, graph, end)
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:
@@ -597,7 +645,8 @@ def emit_function(rom: bytes, bank: int, start: int,
     def _tail_call_stmt(call_expr: str, comment: str,
                         nlr_info_for_block: Optional[dict] = None,
                         *,
-                        prefix: str = "") -> str:
+                        prefix: str = "",
+                        tramp_pc24: Optional[int] = None) -> str:
         # Option-1 cpu->S ABI: a tail JMP/JML does NOT push a return frame;
         # the tail callee inherits THIS function's host-return validity (a
         # tail-call hands off our return obligation) and THIS function's
@@ -606,6 +655,37 @@ def emit_function(rom: bytes, bank: int, start: int,
         # it flows through cpu->S + dispatch, so nlr_info_for_block is
         # ignored here.
         del nlr_info_for_block
+        # Trampoline (same-bank tail-calls only, tramp_pc24 given): a DISPATCHED
+        # frame (_hrv==0) running inside a cpu_dispatch_pc_from driving loop must
+        # NOT make a nested direct C tail-call — a fall-through chain (ActRaiser
+        # $8915->$8966 object loop) then nests the C/recomp stack once per object
+        # and overflows RECOMP_STACK_DEPTH=64 (-> over-unwind SKIP, black
+        # playfield). Instead inherit the entry-S baseline (so the callee's RTS
+        # resolves against it) and yield to the driving loop via TAILCALL. A
+        # PAIRED frame (_hrv==1) is the chain root: keep the direct call (it
+        # drives, bounded depth). Cross-bank tail-calls keep the direct form.
+        if tramp_pc24 is not None:
+            T = f"0x{tramp_pc24 & 0xFFFFFF:06x}u"
+            # _hrv==0: already inside a cpu_dispatch_pc_from driving loop ->
+            #   inherit entry-S + yield via TAILCALL so it iterates flat.
+            # _hrv==1: PAIRED (hardware-JSR) chain root with NO driving loop
+            #   above. A direct nested C tail-call here re-nests the C/recomp
+            #   stack once per iteration (ActRaiser $8915->$8966 object loop
+            #   entered via $82E2's JSR $8915; hrv=1 inherited down the chain),
+            #   leaking the SNES stack ~6B/frame -> underflow SIGSEGV. Instead
+            #   establish a LOCAL driving loop here (cpu_dispatch_pc_from drives
+            #   TAILCALL flat). The target runs dispatched (host_return_valid=0,
+            #   Option-1) -- so do NOT set the inherit-context on this branch,
+            #   or the target's prologue would re-adopt hrv=1 and re-nest.
+            return (
+                f"{prefix}{{ "
+                f"if (!_hrv) {{ cpu->host_return_valid = _hrv; "
+                f"cpu_tailcall_inherit_return_context(_entry_s, _hrv); "
+                f"cpu_tailcall_request({T}, _entry_s, {T}); "
+                f"RecompStackPop(); return RECOMP_RETURN_TAILCALL; }} "
+                f"RecompStackPop(); "
+                f"return cpu_dispatch_pc_from(cpu, {T}, _entry_s, {T}); }}  {comment}"
+            )
         return (
             f"{prefix}{{ cpu->host_return_valid = _hrv; "
             f"cpu_tailcall_inherit_return_context(_entry_s, _hrv); "
@@ -1052,6 +1132,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                 f"/* tail_call into sibling fn at ${target.pc & 0xFFFF:04X} "
                 f"(cfg tail_call: directive) */",
                 prefix=prefix,
+                tramp_pc24=tail_pc24,
             )
 
         # Tail-call past `end:` boundary into a declared sibling
@@ -1089,6 +1170,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                 f"/* tail-call past end: into {sibling_name}{sib_suffix} "
                 f"at ${target.pc & 0xFFFF:04X} */",
                 prefix=prefix,
+                tramp_pc24=target_pc24,
             )
 
         # Unresolvable cross-function jump.
@@ -1456,6 +1538,55 @@ def emit_function(rom: bytes, bank: int, start: int,
                                 )
                         block_terminated = True
                 elif isinstance(op, Return):
+                    if (getattr(di_insn, 'dispatch_kind', None) == 'rts_trick'
+                            and getattr(di_insn, 'dispatch_entries', None)):
+                        # rts_dispatch (RTS-trick, e.g. $03:9156's relocated-
+                        # stack chain): this RTS pops a runtime-pushed
+                        # CONTINUATION address and jumps to it+1, which the
+                        # decoder decoded as in-function blocks. PEEK the
+                        # popped 16-bit return value; for a known target, pop
+                        # the frame (S+=2) and `goto` the in-function label —
+                        # so cpu->S and the whole chain's relocated-stack state
+                        # are preserved (the fix the separate-`func` slicing
+                        # couldn't give). Anything else falls through to the
+                        # normal return below (the chain's TRUE terminal exit
+                        # to the original caller is a separate, normal RTS in
+                        # the dispatched continuation's own decoded path).
+                        lines.append("{ uint16 _rts_s = cpu->S;")
+                        lines.append(
+                            "  uint16 _rts_t = (uint16)(((cpu_read8(cpu, 0x00, "
+                            "(uint16)(_rts_s + 2)) << 8) | cpu_read8(cpu, 0x00, "
+                            "(uint16)(_rts_s + 1))) + 1);")
+                        lines.append("  switch (_rts_t) {")
+                        for _entry in di_insn.dispatch_entries:
+                            _t16 = _entry & 0xFFFF
+                            _tgt = f"L_{_t16:04X}_M{key.m}X{key.x}"
+                            lines.append(
+                                f"    case 0x{_t16:04X}: "
+                                f"cpu->S = (uint16)(_rts_s + 2); goto {_tgt};")
+                        # Unregistered continuation target: the chain pushed a
+                        # CONTINUATION addr we never listed in `rts_dispatch`, so
+                        # we cannot `goto` an in-function label and instead fall
+                        # through to the generic host-return below — which, after
+                        # this RTS's SEP/REP, can leak the wrong m/x to the caller
+                        # (the $03:9156 act->sim M0X0 leak class). Log it (env-
+                        # gated, default silent) so a missing target is named at
+                        # runtime: add it to the `rts_dispatch` directive.
+                        _site24 = (_SAME_BANK << 16) | (di_insn.pc & 0xFFFF)
+                        lines.append(
+                            "    default:")
+                        lines.append(
+                            "      if (getenv(\"AR_RTSDISP_MISS\"))")
+                        lines.append(
+                            "        fprintf(stderr, \"[rts_dispatch_miss] site=$"
+                            f"{_site24:06X} popped target=$%04X "
+                            "(UNREGISTERED -> generic return; add to "
+                            "rts_dispatch) S=$%04X m=%d x=%d\\n\", "
+                            "(unsigned)_rts_t, (unsigned)cpu->S, "
+                            "(int)cpu->m_flag, (int)cpu->x_flag);")
+                        lines.append(
+                            "      break;  /* unknown -> normal return */")
+                        lines.append("  } }")
                     for ln in emit_op(op):
                         lines.append(ln)
                     block_terminated = True
@@ -1617,6 +1748,24 @@ def emit_function(rom: bytes, bank: int, start: int,
     # Trace ring: function entry (carries name hash) — first entry per call.
     fn_entry_pc = (bank << 16) | (start & 0xFFFF)
     src.append(f'  cpu_trace_func_entry(cpu, 0x{fn_entry_pc:06X}, "{func_name}");')
+    # Invariant check (AR_MXCHECK): this variant was emitted ASSUMING entry
+    # m={entry_m},x={entry_x}. Dispatched calls always match (the switch picks
+    # by runtime flags); a DIRECT call here bakes in the emitter's static
+    # m/x analysis, so a runtime mismatch means that analysis was wrong — the
+    # exact "m/x leak / wrong-variant" bug class — caught at its origin.
+    # Near-free when AR_MXCHECK is unset (one global load + branch).
+    src.append(
+        f'  ar_entry_mx_check(cpu, {entry_m & 1}, {entry_x & 1}, '
+        f'"{func_name}", 0x{fn_entry_pc:06X});')
+    # Garbage-variant dispatch trap: this variant's decode is a split-immediate
+    # misdecode (BRK at ${0:04X} is mid-instruction in a valid sibling). Entering
+    # it means a leaked m/x flag dispatched here — fire the trap at the exact
+    # entry so the leak is caught at/near its root (DEBUG.md "garbage-variant
+    # trap"). Default-on, non-fatal, deduped.
+    if _garbage_brk_pc is not None:
+        src.append(
+            f'  ar_garbage_variant_trap(cpu, "{func_name}", 0x{fn_entry_pc:06X});'
+            f'  /* split-immediate BRK at ${_garbage_brk_pc:04X} */')
     # Function-local NLR pending-skip — NOT cpu state. NLR-pattern blocks
     # set this before fall-through to the Return-terminated successor;
     # the Return op reads + clears it. Local-scoped so:
@@ -1664,7 +1813,7 @@ def emit_function(rom: bytes, bank: int, start: int,
     # return-to-ancestor RTS (manual PLA/PLX/PLB rebalance + RTS) can be
     # resolved to a SKIP_N non-local return (cpu_resolve_ancestor_skip).
     # Index by the just-pushed g_recomp_stack_top; pop is implicit (top--).
-    src.append(f'  if (g_recomp_stack_top >= 1) g_cpu_entry_s[g_recomp_stack_top - 1] = _entry_s;')
+    src.append(f'  if (g_recomp_stack_top >= 1) {{ g_cpu_entry_s[g_recomp_stack_top - 1] = _entry_s; g_cpu_entry_hrv[g_recomp_stack_top - 1] = _hrv; }}')
     for i, key in enumerate(block_order):
         src.append(f"  {_label_for(key)}:")
         # Trace block entry — gives us the SNES PC chain in the trace ring.

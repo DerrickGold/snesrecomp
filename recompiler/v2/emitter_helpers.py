@@ -165,6 +165,6 @@ def call_with_pb_save(target_bank: int, callee_name: str) -> List[str]:
         # tripwire ignores the LEGITIMATE imbalance from skipping
         # this function's post-JSL cleanup.
         "  cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-        "  return (RecompReturn)((int)_r - 1);",
+        "  return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
         "}",
     ]

@@ -469,6 +469,33 @@ void cpu_trace_stack_drift_check(uint16_t entry_S, uint16_t exit_S,
     if (snes_frame_counter < t->frame_min) return;
     /* The actual invariant: function exit must preserve S. */
     if (entry_S == exit_S) return;
+    /* A per-frame push leak shows as a NET PUSH (exit S below entry S, i.e.
+     * negative delta in 16-bit stack terms). Positive deltas are the
+     * Option-1 dispatch/trampoline ABI legitimately popping a caller frame
+     * on a drive/skip — ignore those for this hunt. */
+    if ((int)exit_S - (int)entry_S > 0) return;
+    /* Skip the interrupt handlers (Nmi/Irq): invoked under a
+     * SaveRegs/RestoreRegs wrapper that forcibly restores cpu->S, so their
+     * internal RTI imbalance (+4 native) never actually leaks — guaranteed
+     * false positives for a per-frame push-leak hunt. */
+    if (func_name && strstr(func_name, "Handler")) return;
+    /* Skip everything executed while an interrupt handler is on the host
+     * stack (set by the game's NMI/IRQ invocation wrapper). The wrapper
+     * restores cpu->S afterward, so any imbalance in a handler callee is
+     * undone and is a false positive for a main-loop push-leak hunt. */
+    { extern volatile int g_ar_in_interrupt; if (g_ar_in_interrupt) return; }
+
+    /* AR_DRIFT_LOG=1: log-and-continue mode. Print every qualifying
+     * negative-delta NORMAL exit (with recomp depth) instead of latching
+     * once, so a repeated shallow per-frame leaker stands out across a few
+     * frames. */
+    if (getenv("AR_DRIFT_LOG")) {
+        extern int g_recomp_stack_top;
+        fprintf(stderr, "[drift_log] f=%d %s dS=%+d entry=$%04X exit=$%04X depth=%d\n",
+                snes_frame_counter, func_name ? func_name : "?",
+                (int)exit_S - (int)entry_S, entry_S, exit_S, g_recomp_stack_top);
+        return;  /* don't latch in log mode */
+    }
 
     t->triggered = 1;
     t->frame = snes_frame_counter;
@@ -1184,6 +1211,49 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    /* Investigation: block-boundary DB shadow. Catches EVERY DB change
+     * (inline PLBs bypass cpu_trace_db_change), reporting the block where it
+     * was first observed + the immediately-preceding block (which did it).
+     * Window = SNESRECOMP_DBTRACE="lo-hi" (decimal frames). Default off.
+     * Ported from upstream snesrecomp (runner-side diagnostic, no codegen). */
+    {
+        extern int snes_frame_counter;
+        static int dbs_init = 0, dbs_lo = -1, dbs_hi = -1;
+        static uint8_t dbs_last = 0xFF;
+        static uint32_t dbs_prev_pc = 0;
+        if (!dbs_init) {
+            dbs_init = 1;
+            const char *_e = getenv("SNESRECOMP_DBTRACE");
+            if (_e) sscanf(_e, "%d-%d", &dbs_lo, &dbs_hi);
+        }
+        if (dbs_lo >= 0 && cpu->DB != dbs_last &&
+            snes_frame_counter >= dbs_lo && snes_frame_counter <= dbs_hi) {
+            fprintf(stderr, "[dbs] f=%d DB $%02X->$%02X in block $%06X "
+                    "(prev block $%06X) S=%04X\n",
+                    snes_frame_counter, dbs_last, cpu->DB, dbs_prev_pc, pc24,
+                    cpu->S);
+        }
+        dbs_last = cpu->DB;
+        dbs_prev_pc = pc24;
+    }
+    /* S-boundary probe (reusable): log cpu->S + DB at every block whose PC is
+     * in SNESRECOMP_SBOUND="lo-hi" (hex pc24). Used to localize a stack
+     * imbalance to a specific call site by watching S step across a routine's
+     * sub-call boundaries (the block where S jumps is the over/under-popper).
+     * Default off; the watched range is narrow so it never floods. */
+    {
+        extern int snes_frame_counter;
+        static int sb_init = 0; static long sb_lo = -1, sb_hi = -1;
+        if (!sb_init) {
+            sb_init = 1;
+            const char *_e = getenv("SNESRECOMP_SBOUND");
+            if (_e) sscanf(_e, "%lx-%lx", &sb_lo, &sb_hi);
+        }
+        if (sb_lo >= 0 && (long)pc24 >= sb_lo && (long)pc24 <= sb_hi)
+            fprintf(stderr, "[sbound] f=%d pc=$%06X S=$%04X DB=$%02X\n",
+                    snes_frame_counter, (unsigned)pc24,
+                    (unsigned)cpu->S, (unsigned)cpu->DB);
+    }
     /* Inspection-freeze trigger (reusable). Armed once from the
      * environment so it covers the very first frames with no
      * arming race; the TCP command can also set g_freeze_at_frame. */

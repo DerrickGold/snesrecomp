@@ -34,7 +34,15 @@ void RecompStackPop(void);
  * _entry_s into g_cpu_entry_s[g_recomp_stack_top-1]. */
 extern int g_recomp_stack_top;
 extern uint16_t g_cpu_entry_s[];
+/* Parallel per-frame paired-host-caller (hrv) flag; cpu_resolve_ancestor_skip
+ * stops at the nearest hrv=1 frame so a skip can't escape a JSR boundary. */
+extern uint8_t g_cpu_entry_hrv[];
 int cpu_resolve_ancestor_skip(uint16_t ret_s);
+/* Trampoline tail-dispatch request (see common_cpu_infra.c / cpu_dispatch_pc_from). */
+extern uint32_t g_tailcall_pc24;
+extern uint16_t g_tailcall_miss_s;
+extern uint32_t g_tailcall_src24;
+void cpu_tailcall_request(uint32_t pc24, uint16_t miss_s, uint32_t src24);
 void cpu_tailcall_inherit_return_context(uint16_t entry_s, uint8_t hrv);
 int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv);
 #include <setjmp.h>

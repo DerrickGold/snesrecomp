@@ -33,6 +33,11 @@
 
 CpuState g_cpu;
 
+/* Diagnostic accessors for files without the full CpuState definition
+ * (e.g. snes.c, which only forward-declares it). */
+uint16 ar_cpu_S(void)  { return g_cpu.S; }
+uint8  ar_cpu_PB(void) { return g_cpu.PB; }
+
 /* Map a 24-bit logical address onto a g_ram offset. Returns -1 for
  * addresses that are NOT WRAM — the caller routes those to the HW-reg
  * helpers (WriteReg/ReadReg) or to ROM. */
@@ -151,8 +156,95 @@ static void cpu_hw_log(uint16 addr, int is_read, uint16 val) {
 
 uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
     int off = cpu_ram_offset(bank, addr);
-    if (off >= 0) return cpu->ram[off];
-    if (is_hw_reg(bank, addr)) { cpu_pace_cycles(addr); cpu_hw_log(addr, 1, 0); return ReadReg(addr); }
+    if (off >= 0) {
+        /* AR_STACKPROV over-pop detector: a pull/RTS reads at addr==cpu->S (after
+         * the emitted S++). If that slot was NEVER pushed this run, the pop is
+         * draining stale memory => a net over-pop — the FIRST one is the actual
+         * imbalance bug, upstream of where a later RTS returns to garbage. Name
+         * the popping block-PC so we can fix the unbalanced routine directly. */
+        if (bank == 0 && addr == cpu->S) {
+            extern int ar_strace_active(void);
+            extern void ar_strace_op(const char *, uint16, uint8, uint16);
+            if (ar_strace_active()) ar_strace_op("POP", addr, cpu->ram[off], cpu->S);
+            extern int ar_stackprov_enabled(void);
+            if (ar_stackprov_enabled()) {
+                extern uint32_t g_stack_pusher[];
+                if (g_stack_pusher[addr] == 0) {
+                    extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+                    extern int snes_frame_counter;
+                    static uint32_t seen[64]; static int nseen;
+                    uint32_t blk = g_ar_blk_ring[(g_ar_blk_idx - 1u) & 1023u];
+                    int dup = 0;
+                    for (int i = 0; i < nseen; i++) if (seen[i] == blk) { dup = 1; break; }
+                    if (!dup && nseen < 64) {
+                        seen[nseen++] = blk;
+                        extern uint8 g_ram[0x20000];
+                        unsigned _gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+                        fprintf(stderr, "[overpop] pop at block $%06X read NEVER-PUSHED "
+                                "stack slot $%04X (S=$%04X, f=%d gf=%u) — unbalanced "
+                                "pop/RTS draining stale stack. (AR_XFLIP_GF=%u to find "
+                                "the x-leak on this frame.)\n", blk, addr, cpu->S,
+                                snes_frame_counter, _gf, _gf);
+                        /* Walk the block ring back to the most recent block where x
+                         * flipped 0->1 — that block (the SEP/PLP in it) is the x-leak
+                         * that selected a garbage (wrong-width) variant upstream of
+                         * this drain. NOTE: don't gate on the LIVE cpu->x_flag — the
+                         * crashing block ($9284's `...PLP;RTS`) has already PLP'd x
+                         * back to 0 by the time we're here; the leaked-x history lives
+                         * in the ring's per-block-entry x-bit (aux bit17). Also print
+                         * the recent x/m trail so a benign late SEP isn't mistaken for
+                         * the leak. (aux: bit17=x_flag, bit16=m_flag.) */
+                        extern uint32_t g_ar_blk_aux[];
+                        {
+                            unsigned cur = (g_ar_blk_idx - 1u) & 1023u;
+                            int found = 0;
+                            for (int k = 1; k < 600; k++) {
+                                unsigned i0 = (cur - (unsigned)k) & 1023u;
+                                unsigned i1 = (cur - (unsigned)k + 1u) & 1023u;
+                                int x0 = (g_ar_blk_aux[i0] >> 17) & 1;
+                                int x1 = (g_ar_blk_aux[i1] >> 17) & 1;
+                                if (x0 == 0 && x1 == 1) {
+                                    fprintf(stderr, "[overpop]   x flipped 0->1: block "
+                                            "$%06X (m=%u) -> $%06X (the SEP/PLP that "
+                                            "leaked x is in $%06X).\n",
+                                            g_ar_blk_ring[i0],
+                                            (g_ar_blk_aux[i0] >> 16) & 1,
+                                            g_ar_blk_ring[i1], g_ar_blk_ring[i0]);
+                                    found = 1;
+                                    break;
+                                }
+                            }
+                            if (!found)
+                                fprintf(stderr, "[overpop]   no x 0->1 flip in last 600 "
+                                        "blocks (x leak older, or not an x-leak).\n");
+                            /* Recent block trail with per-block x/m so the flip is
+                             * visible in context. */
+                            fprintf(stderr, "[overpop]   recent trail (newest last):\n");
+                            for (int k = 16; k >= 0; k--) {
+                                unsigned i = (cur - (unsigned)k) & 1023u;
+                                fprintf(stderr, "[overpop]     $%06X x=%u m=%u\n",
+                                        g_ar_blk_ring[i], (g_ar_blk_aux[i] >> 17) & 1,
+                                        (g_ar_blk_aux[i] >> 16) & 1);
+                            }
+                        }
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+        return cpu->ram[off];
+    }
+    if (is_hw_reg(bank, addr)) {
+      if (addr >= 0x2100 && addr <= 0x2133) {
+        static int dbg_done;
+        if (!dbg_done) { dbg_done = 1;
+          fprintf(stderr, "[cpu_read8 PPU] bank=%02X addr=%04X | A=%04X X=%04X "
+                  "Y=%04X D=%04X DB=%02X PB=%02X S=%04X | m_flag=%d x_flag=%d P=%02X\n",
+                  bank, addr, cpu->A, cpu->X, cpu->Y, cpu->D, cpu->DB,
+                  cpu->PB, cpu->S, cpu->m_flag, cpu->x_flag, cpu->P);
+        }
+      }
+      cpu_pace_cycles(addr); cpu_hw_log(addr, 1, 0); return ReadReg(addr); }
     int sram = cpu_sram_offset(bank, addr);
     if (sram >= 0) return g_sram[sram];
     /* ROM read. RomPtr requires the global g_rom pointer to be live. */
@@ -185,6 +277,57 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
+        /* AR_STACKPROV pusher-provenance: in emitted push code the byte is
+         * written to cpu->S BEFORE S is decremented, so addr==cpu->S uniquely
+         * marks a stack push. Stamp the current block-PC as this slot's pusher
+         * so a later bad-RTS can name who left the corrupt return frame. */
+        if (bank == 0 && addr == cpu->S) {
+            extern int ar_strace_active(void);
+            extern void ar_strace_op(const char *, uint16, uint8, uint16);
+            if (ar_strace_active()) ar_strace_op("PUSH", addr, v, cpu->S);
+            extern int ar_stackprov_enabled(void);
+            if (ar_stackprov_enabled()) {
+                extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+                extern uint32_t g_stack_pusher[]; extern unsigned g_stack_pusher_frame[];
+                extern int snes_frame_counter;
+                g_stack_pusher[addr] = g_ar_blk_ring[(g_ar_blk_idx - 1u) & 1023u];
+                g_stack_pusher_frame[addr] = (unsigned)snes_frame_counter;
+            }
+        }
+        /* AR_WATCH18: trace game-mode byte $7E:0018 changes (overworld $18=0
+         * vs action stage $18=1) — find who drives the mode transition and
+         * what the display state is at that moment. */
+        if (off == 0x18 && old != v && getenv("AR_WATCH18")) {
+            extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+            extern const char *g_last_recomp_func;
+            extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+            (void)g_recomp_stack; (void)g_recomp_stack_top;
+            uint16 s = cpu->S;
+            fprintf(stderr, "[$18] f=%d %02x->%02x $19=%02x by=%s PB=%02x S=%04x snstk:",
+                    snes_frame_counter, old, v, g_ram[0x19],
+                    g_last_recomp_func ? g_last_recomp_func : "?", cpu->PB, s);
+            for (int i = 1; i <= 18; i++)
+                fprintf(stderr, " %02x", g_ram[(uint16)(s + i)]);
+            fprintf(stderr, "\n");
+        }
+        /* AR_WATCHOBJ=<hexaddr>: trip when WRAM offset [addr,addr+0x3f) (one
+         * object slot) is written — logs writer func + recomp stack + frame, to
+         * find the spawner of an object (and why a sibling slot is never written). */
+        if (getenv("AR_WATCHOBJ")) {
+            static long wo = -2;
+            if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
+            if (wo >= 0 && off >= wo && off < wo + 0x40 && old != v) {
+                extern int snes_frame_counter; extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                extern const char *g_last_recomp_func;
+                static int n;
+                if (n++ < 8000) {
+                    fprintf(stderr, "[wobj] $%04x=%02x (was %02x) f=%d PB=%02x cur=%s stk:", off, v, old, snes_frame_counter, cpu->PB, g_last_recomp_func ? g_last_recomp_func : "?");
+                    for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+                        fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
         cpu->ram[off] = v;
         cpu_trace_wram_write_check(cpu, bank, addr, off,
                                    (uint16)old, (uint16)v, 1);
@@ -213,6 +356,41 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
                    | ((uint16)cpu->ram[off + 1] << 8);
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
+        if (getenv("AR_WATCHOBJ")) {
+            static long wo = -2;
+            if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
+            if (wo >= 0 && off >= wo && off < wo + 0x40 && old != v) {
+                extern int snes_frame_counter; extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                extern const char *g_last_recomp_func;
+                static int n;
+                if (n++ < 8000) {
+                    fprintf(stderr, "[wobj] $%04x=%04x (was %04x) f=%d PB=%02x cur=%s stk:", off, v, old, snes_frame_counter, cpu->PB, g_last_recomp_func ? g_last_recomp_func : "?");
+                    for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+                        fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+        /* AR_WATCH16=<hex>: trip when this 16-bit value is written to WRAM —
+         * who corrupts an object's $12 handler pointer to a data-table addr
+         * ($AB3C action-level freeze). Logs the dest addr, the writing recomp
+         * fn, m/x, and a short call stack. */
+        if (getenv("AR_WATCH16")) {
+            static int wv = -2;
+            if (wv == -2) { const char *e = getenv("AR_WATCH16"); wv = e ? (int)strtoul(e, NULL, 16) : -1; }
+            if (wv >= 0 && v == (uint16)wv) {
+                extern int snes_frame_counter;
+                extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                extern const char *g_last_recomp_func;
+                int top = g_recomp_stack_top;
+                fprintf(stderr, "[watch16] v=%04x -> %02x:%04x (off=%05x) by=%s m=%u x=%u f=%d stack:",
+                        v, bank, addr, off, g_last_recomp_func ? g_last_recomp_func : "?",
+                        (unsigned)cpu->m_flag, (unsigned)cpu->x_flag, snes_frame_counter);
+                for (int i = top - 1; i >= 0 && i >= top - 8; i--)
+                    fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                fprintf(stderr, "\n");
+            }
+        }
         cpu_trace_wram_write_check(cpu, bank, addr, off, old, v, 2);
 #if SNESRECOMP_REVERSE_DEBUG
         extern void debug_on_wram_write_word(uint32_t, uint16_t, uint16_t);
@@ -312,7 +490,13 @@ static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState
     return NULL;
 }
 
-RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
+/* One dispatch step: resolve pc24 to a function variant and invoke it. May
+ * return RECOMP_RETURN_TAILCALL (the invoked dispatched frame asked to tail-
+ * dispatch to g_tailcall_pc24); the driving loop in cpu_dispatch_pc_from
+ * consumes that and iterates, so a computed-jump loop runs flat instead of
+ * nesting the C/recomp stack (which overflowed RECOMP_STACK_DEPTH=64 and
+ * produced over-unwinding SKIP_N — ActRaiser action-stage black playfield). */
+static RecompReturn _cpu_dispatch_once(CpuState *cpu, uint32 pc24,
                                   uint16 entry_s_for_miss_restore,
                                   uint32 source_pc24) {
     pc24 &= 0xFFFFFFu;
@@ -332,7 +516,148 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
         }
     }
     _dispatch_log_record(pc24, source_pc24, mx_idx, fp != NULL, via_mirror);
+    /* AR_B127LOG: trace the dispatch to $02:B127 (the m-flag-misdecode handler).
+     * B127 must run M=1 (8-bit); if mx_idx has m=0 it misdecodes LDA #$1480. Logs
+     * the m/x flags, the source PC that dispatched it, and the recomp call stack. */
+    if (pc24 == 0x02B127u && getenv("AR_B127LOG")) {
+        extern int snes_frame_counter; extern int g_recomp_stack_top;
+        extern const char *g_recomp_stack[];
+        fprintf(stderr, "[b127] ->%06x from %06x mx=%u (m=%u x=%u) S=%04x f=%d\n",
+                pc24, source_pc24, mx_idx, (unsigned)cpu->m_flag,
+                (unsigned)cpu->x_flag, cpu->S, snes_frame_counter);
+        for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 10; i--)
+            fprintf(stderr, "[b127]   [%d] %s\n", i, g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+    }
+    /* AR_1EHIT: trace every $1E,X object-handler dispatch (source $8668 =
+     * $8661/$8657's LDA $1E,X; PHA; RTS). The newly-registered $8657 yield
+     * continuations run here; the last one before a hang/corruption is the
+     * culprit. Logs target, m/x, found, SNES S, recomp depth, frame. */
+    if (source_pc24 == 0x008668u && getenv("AR_1EHIT")) {
+        extern int snes_frame_counter; extern int g_recomp_stack_top;
+        static unsigned long n;
+        if (n++ < 4000)
+            fprintf(stderr, "[1e] ->%06x mx=%u found=%d S=%04x top=%d f=%d\n",
+                    pc24, mx_idx, fp != NULL, cpu->S, g_recomp_stack_top,
+                    snes_frame_counter);
+    }
+    /* AR_8966X: trace the $8915 object-loop continuation ($8966). Logs the loop
+     * index X and the object status word read at $00,X each iteration, so an X
+     * walk-off (past the object table into $2xxx PPU regs) or a corrupted
+     * sentinel is visible, plus the source (who re-entered the loop) + depth. */
+    if (pc24 == 0x008966u && getenv("AR_8966X")) {
+        extern int snes_frame_counter; extern int g_recomp_stack_top;
+        extern uint8 g_ram[0x20000];
+        static unsigned long n;
+        unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+        const char *gfe = getenv("AR_8966X_GF");
+        long wantgf = gfe ? atol(gfe) : -1;
+        uint16 x = cpu->X;
+        uint16 sw = (uint16)(g_ram[x & 0x1FFFF] | (g_ram[(x + 1) & 0x1FFFF] << 8));
+        if (n++ < 4000 && (wantgf < 0 || (long)gf == wantgf))
+            fprintf(stderr, "[8966] X=%04x [$00,X]=%04x S=%04x m=%u src=%06x top=%d f=%d\n",
+                    x, sw, cpu->S, (unsigned)cpu->m_flag, source_pc24, g_recomp_stack_top, snes_frame_counter);
+    }
+    /* AR_8966X: also log every object-handler dispatch (source $8965 = $895C's
+     * LDA #$8965;PHA; LDA $12,X;DEC;PHA;RTS). Shows X AT HANDLER ENTRY + the
+     * handler addr; pairing with the next [8966] X (handler must preserve X)
+     * names the handler that corrupts the loop index. */
+    if (source_pc24 == 0x008965u && getenv("AR_8966X")) {
+        extern int snes_frame_counter;
+        extern uint8 g_ram[0x20000];
+        static unsigned long n;
+        unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+        const char *gfe = getenv("AR_8966X_GF");
+        long wantgf = gfe ? atol(gfe) : -1;
+        if (n++ < 4000 && (wantgf < 0 || (long)gf == wantgf))
+            fprintf(stderr, "[hdlr] ->%06x X=%04x S=%04x m=%u f=%d\n",
+                    pc24, cpu->X, cpu->S, (unsigned)cpu->m_flag, snes_frame_counter);
+    }
+    /* TEMP DIAGNOSTIC AR_DISP8465: log every dispatch that targets $00:8465
+     * (the misdecoded NMI-enable routine) — reveals WHO dispatches to it and in
+     * what M/X state, since the steady-state freeze enters 8465_M0X0 at top
+     * level (not via 82E2's JSR). */
+    if ((pc24 == 0x008465u || pc24 == 0x008466u) && getenv("AR_DISP8465")) {
+        extern int snes_frame_counter;
+        static unsigned long n;
+        if ((n++ % 600) == 0)
+            fprintf(stderr, "[disp] ->%06x from %06x m=%u x=%u S=%04x found=%d f=%d (n=%lu)\n",
+                    pc24, source_pc24, (unsigned)cpu->m_flag, (unsigned)cpu->x_flag,
+                    cpu->S, fp != NULL, snes_frame_counter, n);
+    }
     if (fp == NULL) {
+        /* ActRaiser action-stage object loop ($8915) dispatches each object's
+         * per-frame behavior through a RAM handler pointer ($895C: LDA $12,X;
+         * DEC; PHA; RTS, pushing the $8965 continuation first). The handler set
+         * is a data-driven state machine -- many handlers are 2-byte BRA/BRL
+         * trampolines scattered inside data tables (e.g. record+$C `BRA $AB58`),
+         * so they cannot all be statically enumerated as cfg funcs. A naive miss
+         * here abandons the whole loop before its $896E PLP, leaking m=0 ->
+         * $8465 BRK-misdecode -> action-level freeze. So handle object-loop
+         * misses specially: (1) follow a BRA/BRL to its shared handler and
+         * dispatch that; (2) else gracefully resume the loop continuation so the
+         * loop completes and m is restored (object skips one frame, no freeze).
+         * Logging records each miss + its branch target + whether it resolved,
+         * so the shared handlers can later be registered statically (after which
+         * BRA-follow resolves every trampoline that points at them). */
+        if (source_pc24 == 0x008965u || source_pc24 == 0x008966u) {
+            uint8  tb = (uint8)((pc24 >> 16) & 0xFF);
+            uint16 ta = (uint16)(pc24 & 0xFFFF);
+            uint8  op = cpu_read8(cpu, tb, ta);
+            uint32 followed = 0xFFFFFFFFu;
+            if (op == 0x80) {            /* BRA rel8 */
+                int8 d = (int8)cpu_read8(cpu, tb, (uint16)(ta + 1));
+                followed = ((uint32)tb << 16) | (uint16)(ta + 2 + d);
+            } else if (op == 0x82) {     /* BRL rel16 */
+                uint16 d = (uint16)(cpu_read8(cpu, tb, (uint16)(ta + 1))
+                          | (cpu_read8(cpu, tb, (uint16)(ta + 2)) << 8));
+                followed = ((uint32)tb << 16) | (uint16)(ta + 3 + d);
+            }
+            RecompReturn (*ffp)(CpuState *) = NULL;
+            if (followed != 0xFFFFFFFFu) {
+                ffp = _cpu_dispatch_lookup(cpu, followed);
+                if (ffp == NULL) {
+                    uint8 fb = (uint8)((followed >> 16) & 0xFF);
+                    if (fb < 0x40 || (fb >= 0x80 && fb < 0xC0))
+                        ffp = _cpu_dispatch_lookup(cpu, followed ^ 0x800000u);
+                }
+            }
+            if (getenv("AR_DISPMISS")) {
+                extern int snes_frame_counter;
+                static unsigned long n;
+                if (n++ < 400)
+                    fprintf(stderr,
+                        "[dispmiss] handler->%06x op=%02x bra->%06x resolved=%d m=%u x=%u S=%04x f=%d\n",
+                        pc24, op, (followed == 0xFFFFFFFFu) ? 0u : followed,
+                        ffp != NULL, (unsigned)cpu->m_flag, (unsigned)cpu->x_flag,
+                        cpu->S, snes_frame_counter);
+            }
+            if (ffp != NULL) {
+                /* BRA/BRL is non-destructive (no stack change). Dispatch the
+                 * shared handler in place of the unregistered trampoline; its
+                 * own RTS pops the $8965 continuation and resumes the loop. */
+                cpu->host_return_valid = 0;
+                return ffp(cpu);
+            }
+            /* Graceful fallback: emulate the handler's RTS without running it --
+             * pop the $8965 continuation frame the trampoline left on top of the
+             * stack and dispatch the loop continuation ($8966). The loop runs to
+             * its $896E PLP, restoring m; only this object's behavior is skipped
+             * this frame. */
+            {
+                uint16 sp = cpu->S;
+                uint16 cl = cpu_read8(cpu, 0x00, (uint16)(sp + 1));
+                uint16 ch = cpu_read8(cpu, 0x00, (uint16)(sp + 2));
+                uint32 cont = (uint32)((((ch << 8) | cl) + 1) & 0xFFFFu);
+                cpu->S = (uint16)(sp + 2);
+                RecompReturn (*cfp)(CpuState *) = _cpu_dispatch_lookup(cpu, cont);
+                if (cfp != NULL) {
+                    cpu->host_return_valid = 0;
+                    return cfp(cpu);
+                }
+                /* continuation itself unregistered (shouldn't happen: $8966 is a
+                 * cfg func) -- fall through to the generic unwind below. */
+            }
+        }
         /* Not found: the popped (PB:PC) is a normal mid-caller return addr,
          * not a known function entry. Unwind by restoring cpu->S to the value
          * the caller expects after THIS function returns and returning NORMAL.
@@ -343,6 +668,111 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
          * bare entry_s here would under-pop by frame_size and leak the caller's
          * frame on every miss (the heavy-load DMA-queue-corruption softlock;
          * cf. MMX Dr Light "sprite vanish" 2026-05-24). */
+        /* AR_DISPMISSALL: log EVERY dispatch miss while in the action stage
+         * ($18==01), with its source — catches computed-dispatch misses to
+         * unemitted routines (e.g. bank-02 fade routines $AB30/$AB6B) that the
+         * $8965-gated AR_DISPMISS never saw. A miss to the action-stage fade-in
+         * routine would silently skip it -> black playfield. */
+        if (getenv("AR_DISPMISSALL")) {
+            extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+            if (g_ram[0x18] == 0x01) {
+                static unsigned long n;
+                if (n++ < 50000)
+                    fprintf(stderr, "[missall] ->%06x from %06x m=%u x=%u f=%d\n",
+                            pc24, source_pc24, (unsigned)cpu->m_flag,
+                            (unsigned)cpu->x_flag, snes_frame_counter);
+            }
+        }
+        /* Dispatch-miss tripwire (default ON, deduped + capped). Reaching here
+         * means an RTS/RTL/computed dispatch popped a (PB:PC) that is NOT a
+         * registered function entry, so we host-unwind to the lexical caller.
+         * That is correct for an ordinary mid-caller return — but it is ALSO
+         * exactly how an RTS-TRICK to an intra-function label goes silently
+         * wrong: the unwind resumes the WRONG pc carrying whatever m/x the trick
+         * left set. That is the $03:9156 act->sim transition crash (dispatch
+         * 039B59 -> 039B22 had no entry -> host-unwound to $8053:$80B6 at m=1 ->
+         * $AC8E ran its garbage M1X0 variant -> SNES stack underflow -> $2133
+         * PPU-reg scribble -> abort). It cost a long multi-tool hunt; this names
+         * the offending computed target on the FIRST run instead. The fix for a
+         * real one is to register the target as a cfg `func ... entry_mx:m,x`.
+         * Warn once per (source,target) pair so benign repeats stay quiet;
+         * suppress entirely with AR_NODISPWARN=1, add the call stack with
+         * AR_DISPWARN=1. See DEBUG.md "Dispatch-miss / RTS-trick" section. */
+        {
+            static int warn = -1, warnall = -1;
+            if (warn < 0) warn = getenv("AR_NODISPWARN") ? 0 : 1;
+            if (warnall < 0) warnall = getenv("AR_DISPWARN") ? 1 : 0;
+            /* By default only flag the DANGEROUS subset: a miss while the SNES
+             * stack is relocated out of page 0/1 (S >= $0200) — the RTS-trick /
+             * computed-dispatch signature. Ordinary mid-caller returns unwind
+             * here too but with S in page 1; flagging those would bury the
+             * signal under benign noise and fill the cap. AR_DISPWARN=1 removes
+             * the gate (shows every miss) and adds the call stack. */
+            extern int ar_stackprov_enabled(void);
+            if ((warn && (warnall || cpu->S >= 0x0200)) || ar_stackprov_enabled()) {
+                static struct { uint32_t s, t; } seen[128];
+                static int nseen, capped;
+                int dup = 0;
+                for (int i = 0; i < nseen; i++)
+                    if (seen[i].s == source_pc24 && seen[i].t == pc24) { dup = 1; break; }
+                if (!dup && nseen < 128) {
+                    seen[nseen].s = source_pc24; seen[nseen].t = pc24; nseen++;
+                    extern int snes_frame_counter;
+                    fprintf(stderr,
+                        "[dispatch-miss] %06X -> %06X has no entry; host-unwinding "
+                        "(m=%u x=%u S=%04X f=%d). If control/flags are wrong after this, "
+                        "register %06X as a cfg `func` (RTS-trick/computed target).\n",
+                        source_pc24, pc24, cpu->m_flag & 1, cpu->x_flag & 1, cpu->S,
+                        snes_frame_counter, pc24);
+                    if (warnall) {
+                        extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                        for (int i = g_recomp_stack_top - 1;
+                             i >= 0 && i >= g_recomp_stack_top - 8; i--)
+                            fprintf(stderr, "[dispatch-miss]   [%d] %s\n", i,
+                                    g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                    }
+                    /* AR_STACKPROV: name who pushed the corrupt return frame. The
+                     * RTS that produced this bad target popped its 2 bytes from
+                     * just below the current S, so dump the pusher-PC of the slots
+                     * around S. A slot tagged NEVER-PUSHED means the RTS read stale
+                     * memory it never wrote => S itself is wrong (bad relocation),
+                     * not a bad push — the opposite fix. */
+                    {
+                        extern int ar_stackprov_enabled(void);
+                        if (ar_stackprov_enabled()) {
+                            extern uint32_t g_stack_pusher[];
+                            extern unsigned g_stack_pusher_frame[];
+                            fprintf(stderr,
+                                "[stackprov] return-frame provenance around S=$%04X "
+                                "(bad target %06X, f=%d):\n", cpu->S, pc24,
+                                snes_frame_counter);
+                            for (int o = -2; o <= 5; o++) {
+                                uint16 a = (uint16)(cpu->S + o);
+                                uint8 b = cpu_read8(cpu, 0x00, a);
+                                uint32_t pp = g_stack_pusher[a];
+                                if (pp)
+                                    fprintf(stderr,
+                                        "[stackprov]   $%04X = $%02X  pushed-by PC "
+                                        "$%06X (f=%u)%s\n", a, b, pp,
+                                        g_stack_pusher_frame[a],
+                                        (o == -1 || o == 0) ? "  <- return frame" : "");
+                                else
+                                    fprintf(stderr,
+                                        "[stackprov]   $%04X = $%02X  NEVER PUSHED "
+                                        "(stale/wrong-S)%s\n", a, b,
+                                        (o == -1 || o == 0) ? "  <- return frame" : "");
+                            }
+                        }
+                    }
+                    fflush(stderr);
+                } else if (!dup && !capped) {
+                    capped = 1;
+                    fprintf(stderr, "[dispatch-miss] (cap 128 reached; further unique "
+                                    "misses suppressed — set AR_NODISPWARN=1 to silence)\n");
+                    fflush(stderr);
+                }
+            }
+        }
         cpu->S = entry_s_for_miss_restore;
         return RECOMP_RETURN_NORMAL;
     }
@@ -352,6 +782,46 @@ RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
      * chain unwinds when a dispatch misses (S restored above) -> NORMAL. */
     cpu->host_return_valid = 0;
     return fp(cpu);
+}
+
+/* Trampoline driving loop. A dispatched frame that tail-dispatches a computed
+ * jump returns RECOMP_RETURN_TAILCALL (target stashed in g_tailcall_*) instead
+ * of recursively calling this function; we consume it here and iterate, so the
+ * call chain runs flat. Real results (NORMAL / SKIP_N) pass straight through. */
+extern uint32_t g_tailcall_pc24;
+extern uint16_t g_tailcall_miss_s;
+extern uint32_t g_tailcall_src24;
+RecompReturn cpu_dispatch_pc_from(CpuState *cpu, uint32 pc24,
+                                  uint16 entry_s_for_miss_restore,
+                                  uint32 source_pc24) {
+    /* AR_RTSLOG=<hex source pc>: trace the RTS-dispatch chain from a specific
+     * RTS site (e.g. AR_RTSLOG=0x039b59 for $03:9156's stack-relocating RTS-
+     * trick). Logs each hop's target PC, the m/x flags, and S so we can see
+     * exactly where the chain lands and where m diverges from hardware. */
+    static long rtslog = -2;
+    if (rtslog == -2) { const char *e = getenv("AR_RTSLOG");
+        rtslog = e ? (long)strtoul(e, NULL, 0) : -1; }
+    int trace = (rtslog >= 0 && source_pc24 == (uint32)rtslog);
+    int hop = 0;
+    for (;;) {
+        if (trace) {
+            extern int snes_frame_counter;
+            fprintf(stderr, "[rtslog] from=%06X hop=%d -> dispatch pc=%06X  m=%u x=%u S=%04X entry_s=%04X f=%d\n",
+                    source_pc24, hop++, pc24 & 0xFFFFFF, cpu->m_flag & 1, cpu->x_flag & 1,
+                    cpu->S, entry_s_for_miss_restore, snes_frame_counter);
+            fflush(stderr);
+        }
+        RecompReturn r = _cpu_dispatch_once(cpu, pc24,
+                                            entry_s_for_miss_restore, source_pc24);
+        if (r != RECOMP_RETURN_TAILCALL) {
+            if (trace) fprintf(stderr, "[rtslog] from=%06X final r=%d m=%u S=%04X\n",
+                               source_pc24, (int)r, cpu->m_flag & 1, cpu->S);
+            return r;
+        }
+        pc24 = g_tailcall_pc24;
+        entry_s_for_miss_restore = g_tailcall_miss_s;
+        source_pc24 = g_tailcall_src24;
+    }
 }
 
 RecompReturn cpu_dispatch_pc(CpuState *cpu, uint32 pc24,

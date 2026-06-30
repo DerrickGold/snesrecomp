@@ -102,6 +102,24 @@ class BankCfg:
     # entry as a decode successor (for auto-promote / reachability), and
     # stamps `insn.dispatch_entries` so codegen emits a real switch.
     indirect_dispatch: List[dict] = field(default_factory=list)
+    # `rts_dispatch <site_pc16> <target1> [<target2> ...]` directives —
+    # authorise an RTS/RTL "RTS-trick" as an IN-FUNCTION computed dispatch.
+    # Some shared engine routines (e.g. ActRaiser's $03:9156 act->sim
+    # transition dispatcher) relocate the SNES stack and thread a chain of
+    # CONTINUATION addresses they pushed at runtime (`LDA/LDY #imm; PH_`),
+    # then `RTS` through them. Those targets are intra-function labels the
+    # static decoder can't follow (computed pushes), so a plain RTS either
+    # host-unwinds to the wrong place (wrong m/x) or — if the targets are
+    # registered as separate `func`s — breaks the hand-rolled stack
+    # accounting across the function boundary (S over/under-pops). This
+    # directive instead tells the decoder to decode each target as a block
+    # WITHIN the enclosing function and emit the RTS as a `switch` on the
+    # popped value that `goto`s the matching in-function label — so cpu->S
+    # and the relocated-stack state are preserved across the whole chain.
+    # Each entry: {'site_pc16': int, 'targets': Tuple[int,...]} (targets are
+    # the actual jump destinations = pushed_value + 1). The Option-A
+    # autoroute (immediate-push detection) can later populate these.
+    rts_dispatch: List[dict] = field(default_factory=list)
     # `hle_spc_upload <pc>` directives — replace the recompiled body of
     # the function starting at <pc> with a single call to the runtime
     # HLE helper RtlUploadSpcImageFromDp. The standard SNES SPC upload
@@ -340,6 +358,7 @@ def load_bank_cfg(path: str) -> BankCfg:
                         f"{path}: indirect_dispatch count {count} out of range (1..4096)")
                 idx_reg: Optional[str] = None
                 table_bases: Tuple[int, ...] = ()
+                ret_pc16: Optional[int] = None
                 for t in tokens[3:]:
                     if t.startswith('idx:'):
                         v = t[len('idx:'):].upper()
@@ -347,6 +366,19 @@ def load_bank_cfg(path: str) -> BankCfg:
                             raise ValueError(
                                 f"{path}: indirect_dispatch idx: must be X or Y, got {v!r}")
                         idx_reg = v
+                    elif t.startswith('ret:'):
+                        # ret:<pc16> — the PHA/RTS jump table is a CALL, not a
+                        # terminal tail-call: a return address was pushed (e.g.
+                        # `LDY #ret-1; PHY`) BEFORE the handler addr, so each
+                        # handler RTSs back to this in-function continuation.
+                        # Decoder decodes <pc16> as an in-function block and emit
+                        # dispatches each handler as a call then `goto`s it.
+                        # (ActRaiser $01:B8AE jump-table dispatcher.)
+                        try:
+                            ret_pc16 = _parse_hex(t[len('ret:'):]) & 0xFFFF
+                        except ValueError as e:
+                            raise ValueError(
+                                f"{path}: indirect_dispatch ret: bad hex {t!r}: {e}")
                     elif t.startswith('tables:'):
                         raw_bases = t[len('tables:'):].split(',')
                         if len(raw_bases) < 1 or len(raw_bases) > 3:
@@ -369,6 +401,34 @@ def load_bank_cfg(path: str) -> BankCfg:
                     'count': count,
                     'idx_reg': idx_reg,
                     'table_bases': table_bases,
+                    'ret_pc16': ret_pc16,
+                })
+                continue
+
+            # rts_dispatch <site_pc16> <target1> [<target2> ...]
+            #
+            # Authorise an RTS/RTL "RTS-trick" at <site_pc16> as an
+            # in-function computed dispatch over the explicit target list.
+            # Targets are the actual jump destinations (pushed_value + 1).
+            # See BankCfg.rts_dispatch for the full rationale.
+            if head == 'rts_dispatch':
+                if len(tokens) < 3:
+                    raise ValueError(
+                        f"{path}: rts_dispatch needs <site_pc16> <target1> "
+                        f"[<target2> ...] — got: {stripped!r}")
+                try:
+                    rts_site = _parse_hex(tokens[1]) & 0xFFFF
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: rts_dispatch bad site_pc {tokens[1]!r}: {e}")
+                try:
+                    rts_targets = tuple(_parse_hex(t) & 0xFFFF for t in tokens[2:])
+                except ValueError as e:
+                    raise ValueError(
+                        f"{path}: rts_dispatch bad target {stripped!r}: {e}")
+                cfg.rts_dispatch.append({
+                    'site_pc16': rts_site,
+                    'targets': rts_targets,
                 })
                 continue
 
@@ -382,6 +442,7 @@ def load_bank_cfg(path: str) -> BankCfg:
                 end: Optional[int] = None
                 tail_call_pc16: Optional[int] = None
                 exit_mx: Optional[Tuple[int, int]] = None
+                entry_mx: Optional[Tuple[int, int]] = None
                 entry_s_offset_val: int = 0
                 for t in tokens[3:]:
                     if t.startswith('end:'):
@@ -423,6 +484,30 @@ def load_bank_cfg(path: str) -> BankCfg:
                                            int(parts[1]) & 1)
                         except (ValueError, IndexError):
                             pass
+                    elif t.startswith('entry_mx:'):
+                        # Per-function ENTRY (m, x) seed. Format:
+                        # entry_mx:M,X with M and X each 0 or 1. Sets the
+                        # canonical decode/emit width of this function's
+                        # entry. Required for functions reached ONLY via
+                        # runtime computed dispatch (RAM-pointer RTS jump,
+                        # e.g. ActRaiser's $8915 object-loop handler set):
+                        # static variant discovery propagates widths only
+                        # through JSR/JSL/JMP edges, so a dynamically-
+                        # dispatched callee never gets a non-default width
+                        # seeded and the bare `func` default (1,1) emits
+                        # only a wrong-width misdecode, leaving the real
+                        # (m,x) dispatch slot NULL -> dispatch miss ->
+                        # loop abandoned / m-flag leak. Declaring the true
+                        # entry width here emits the correct variant into
+                        # the dispatch table.
+                        try:
+                            mx_str = t[len('entry_mx:'):]
+                            parts = mx_str.split(',')
+                            if len(parts) == 2:
+                                entry_mx = (int(parts[0]) & 1,
+                                            int(parts[1]) & 1)
+                        except (ValueError, IndexError):
+                            pass
                     elif t.startswith('entry_s_offset:'):
                         try:
                             entry_s_offset_val = int(t[len('entry_s_offset:'):])
@@ -435,6 +520,8 @@ def load_bank_cfg(path: str) -> BankCfg:
                 # Non-default attribute on BankEntry; assign post-init.
                 if exit_mx is not None:
                     be.exit_mx = exit_mx
+                if entry_mx is not None:
+                    be.entry_m, be.entry_x = entry_mx
                 cfg.entries.append(be)
                 continue
 

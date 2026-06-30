@@ -52,8 +52,7 @@ set(SNESRECOMP_RUNNER_SOURCES
 option(SNESRECOMP_ENABLE_TRACE "Build the TCP debug server / observability rings" OFF)
 if(SNESRECOMP_ENABLE_TRACE)
     list(APPEND SNESRECOMP_RUNNER_SOURCES
-        ${SNESRECOMP_RUNNER_ROOT}/src/debug_server.c
-        ${SNESRECOMP_RUNNER_ROOT}/src/emu_oracle_cmds.c
+        ${SNESRECOMP_RUNNER_ROOT}/src/debug_server_stub.c
     )
 endif()
 

@@ -41,8 +41,64 @@ if str(_RECOMPILER_DIR) not in sys.path:
 
 from snes65816 import (  # noqa: E402
     decode_insn, lorom_offset, Insn,
-    ABS, INDIR, INDIR_X, LONG, IMM,
+    ABS, INDIR, INDIR_X, LONG, LONG_X, IMM,
 )
+
+
+def _brk_continuation_looks_valid(rom, bank, pc16, m, x, n=8):
+    """Trial-decode up to `n` instructions linearly from a BRK syscall's
+    PC+2 continuation. Returns True if it looks like real code (so the
+    decoder should follow it), False if it looks like data (a guard BRK).
+
+    ActRaiser uses BRK as an inline syscall: `LDA #imm; BRK` traps to the
+    vector handler ($852F, stores A.low -> $035B) and RTIs to PC+2, where
+    real handler code resumes (often `REP #$20; ...; PLP; RTS`). Treating
+    BRK as a terminator drops that continuation — skipping the PLP that
+    restores M/X and leaking flags into the caller (Act-1 item-pickup
+    object-loop hang: handler $879D leaked m=1 past BRK $8840). Guard BRKs,
+    by contrast, are followed by DATA; force-decoding those runs away. This
+    trial validates the continuation so only real ones are followed.
+    """
+    cur_m, cur_x = m & 1, x & 1
+    for _ in range(n):
+        # ROM code only lives in $8000-$FFFF for a LoROM bank; a
+        # continuation that walks out of that window isn't code.
+        if not (0x8000 <= pc16 <= 0xFFFF):
+            return False
+        off = lorom_offset(bank, pc16)
+        if off < 0 or off + 3 >= len(rom):
+            return False
+        ins = decode_insn(rom, off, pc16, bank, cur_m, cur_x)
+        if ins is None:
+            return False
+        mn = ins.mnem
+        # Data-as-code signals (mirror snes65816.validate_decoded_insns).
+        if mn == 'JSL':
+            tb = (ins.operand >> 16) & 0xFF
+            if tb > 0x0D and tb not in (0x7E, 0x7F):
+                return False
+        if ins.mode in (LONG, LONG_X) and mn != 'JSL':
+            ab = (ins.operand >> 16) & 0xFF
+            if ab > 0x0D and ab not in (0x7E, 0x7F):
+                return False
+        if mn == 'JSR' and ins.operand < 0x0800:
+            return False
+        # A clean control-flow point within a few insns => real code.
+        if mn in ('RTS', 'RTL', 'RTI', 'JMP', 'JML', 'BRA', 'BRL', 'BRK'):
+            return True
+        # Track M/X so immediate widths stay correct across REP/SEP.
+        if mn == 'REP':
+            if ins.operand & 0x20:
+                cur_m = 0
+            if ins.operand & 0x10:
+                cur_x = 0
+        elif mn == 'SEP':
+            if ins.operand & 0x20:
+                cur_m = 1
+            if ins.operand & 0x10:
+                cur_x = 1
+        pc16 = (pc16 + ins.length) & 0xFFFF
+    return True
 
 
 def addr24(bank: int, pc: int) -> int:
@@ -618,7 +674,18 @@ class FunctionDecodeGraph:
 
 
 # Mnemonics with no fall-through successor.
-_TERMINATORS = frozenset({'RTS', 'RTL', 'RTI', 'STP', 'WAI', 'BRK'})
+# NB on BRK (deliberately NOT here): ActRaiser (and many SNES titles) use BRK
+# as an inline syscall — it traps to the BRK vector handler ($00:852F: stores
+# A->$035B sound port), which RTIs back to PC+2, so execution CONTINUES with the
+# next instruction. Treating BRK as a no-successor terminator abandons the
+# function mid-stream (PHP/PHB/PHX left unbalanced, m/x unrestored) → caller
+# corruption (the Act-1 player-invisible bug: 8A3C bails at $8b47 before PLB;PLP).
+# BUT BRK is dual-natured: some BRKs are genuine guards followed by DATA, and
+# blindly decoding past those runs away (bank $00 $009832 exceeded max_insns).
+# So BRK gets a DEFERRED 'fall_brk' successor to PC+2 that is NOT force-decoded;
+# a post-pass in decode_function keeps the edge only when PC+2 turned out to be
+# independently-reachable code (a branch/jump target), else drops it (terminal).
+_TERMINATORS = frozenset({'RTS', 'RTL', 'RTI', 'STP', 'WAI'})
 
 # Mnemonics with two successors: fall-through AND taken-branch target.
 _COND_BRANCHES = frozenset({'BPL', 'BMI', 'BVC', 'BVS', 'BCC', 'BCS', 'BNE', 'BEQ'})
@@ -830,6 +897,14 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
 
     if mnem in _TERMINATORS:
         return []
+
+    if mnem == 'BRK':
+        # BRK is a syscall: the vector handler RTIs to PC+2 (BRK is 2 bytes —
+        # opcode + signature). Continue there, but as a DEFERRED 'fall_brk'
+        # edge: the worklist does NOT force-decode PC+2 (that would run away
+        # into data for guard BRKs). The decode_function post-pass keeps this
+        # successor only if PC+2 was independently decoded as reachable code.
+        return [(DecodeKey(addr24(bank, next_pc), post_m, post_x, post_p_stack), 'fall_brk')]
 
     if mnem in ('BRA', 'BRL'):
         return [(DecodeKey(addr24(bank, insn.operand), post_m, post_x, post_p_stack), 'jump')]
@@ -1603,12 +1678,28 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                 entries = _resolve_indirect_dispatch_targets(
                     rom, bank, insn, auth)
                 if entries is not None:
+                    # RTS adds 1 to the pulled (PHA'd) value, so the real
+                    # targets are table_value + 1 (the table stores handler-1,
+                    # the classic RTS jump-table idiom). _resolve returns the
+                    # raw table words; apply the +1 within the same bank.
+                    entries = [None if (e is None or e == 0)
+                               else ((e & 0xFF0000) | ((e + 1) & 0xFFFF))
+                               for e in entries]
                     insn.dispatch_entries = entries
                     insn.dispatch_kind = ('long' if len(auth.get('table_bases', ())) == 3
                                           else 'short')
                     insn.dispatch_idx_reg = auth['idx_reg']
                     insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
-                    insn.dispatch_terminal = True
+                    # `ret:<pc16>` => this PHA/RTS jump table is a CALL (a return
+                    # addr was pushed before the handler addr), so handlers RTS
+                    # back to the in-function continuation; it is NOT terminal.
+                    # Decode the handlers + the continuation at the SITE's (m,x)
+                    # (a call preserves the caller's width), not forced 8-bit.
+                    ret_pc16 = auth.get('ret_pc16')
+                    insn.dispatch_ret = ret_pc16
+                    insn.dispatch_terminal = (ret_pc16 is None)
+                    succ_m = 1 if insn.dispatch_terminal else (insn.m_flag & 1)
+                    succ_x = 1 if insn.dispatch_terminal else (insn.x_flag & 1)
                     labeled_succ = []
                     for e in entries:
                         if e is None or e == 0:
@@ -1617,8 +1708,15 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         e16 = e & 0xFFFF
                         if eb == bank and 0x8000 <= e16 <= 0xFFFF:
                             labeled_succ.append(
-                                (DecodeKey(addr24(eb, e16), 1, 1, ()),
+                                (DecodeKey(addr24(eb, e16), succ_m, succ_x, ()),
                                  'jump'))
+                    if ret_pc16 is not None and 0x8000 <= ret_pc16 <= 0xFFFF:
+                        # The continuation is an in-function block reached after
+                        # the dispatched handler returns; decode it at the call's
+                        # width so emit can `goto L_<ret>_M{m}X{x}`.
+                        labeled_succ.append(
+                            (DecodeKey(addr24(bank, ret_pc16), succ_m, succ_x, ()),
+                             'jump'))
                     succ = [k for (k, _) in labeled_succ]
                     graph.insns[key] = DecodedInsn(key=key, insn=insn,
                                                    successors=succ)
@@ -1761,6 +1859,45 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             ))
             continue
 
+        # cfg `rts_dispatch`: RTS-trick to explicit intra-function
+        # continuations (e.g. ActRaiser $03:9156's relocated-stack chain).
+        # The RTS pops a runtime-computed continuation address pushed far
+        # away (`LDA/LDY #imm; PH_`), so the static decoder never saw the
+        # target. cfg names the explicit target list (shared site_pc24 map
+        # with `indirect_dispatch`, marked 'rts_trick'); decode each as an
+        # in-function 'jump' successor of THIS RTS — so they become labels
+        # INSIDE the enclosing function — and stamp dispatch_entries +
+        # rts_dispatch so emit_function emits a `switch(popped+1){ case T:
+        # goto L_T; }` that preserves cpu->S across the whole chain instead
+        # of host-unwinding to the wrong place / over-popping across a
+        # separate-function boundary (the failure modes of registering the
+        # targets as standalone `func`s). Decode the targets at the RTS's own
+        # (m,x) — that's the state the chain threads at.
+        if insn.mnem in ('RTS', 'RTL'):
+            site_pc24 = (bank << 16) | pc
+            rts_auth = (indirect_dispatch or {}).get(site_pc24)
+            if rts_auth is not None and rts_auth.get('rts_trick'):
+                targets = tuple(t & 0xFFFF for t in rts_auth.get('targets', ()))
+                insn.dispatch_entries = tuple(addr24(bank, t) for t in targets)
+                # Marker (reuses the existing dispatch_kind slot — Insn has
+                # __slots__, so a new attribute would AttributeError). emit
+                # and exit-mx analysis key on dispatch_kind == 'rts_trick'.
+                insn.dispatch_kind = 'rts_trick'
+                insn.dispatch_terminal = True
+                labeled_succ = []
+                for t in targets:
+                    if 0x8000 <= t <= 0xFFFF:
+                        labeled_succ.append(
+                            (DecodeKey(addr24(bank, t), key.m, key.x, ()),
+                             'jump'))
+                succ = [k for (k, _) in labeled_succ]
+                graph.insns[key] = DecodedInsn(key=key, insn=insn,
+                                               successors=succ)
+                for s, sk in labeled_succ:
+                    if s not in graph.insns:
+                        worklist.append((s, sk, pc))
+                continue
+
         labeled_succ = _labeled_successors(
             insn, key, bank,
             callee_exit_mx=callee_exit_mx,
@@ -1770,8 +1907,37 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
         graph.insns[key] = DecodedInsn(key=key, insn=insn, successors=succ)
 
         for s, sk in labeled_succ:
+            # 'fall_brk' (BRK syscall continuation, PC+2): decode it only when
+            # a trial decode shows the continuation is real code (an inline
+            # syscall like `LDA #imm; BRK; <handler resumes>`). Guard BRKs are
+            # followed by DATA — force-decoding those runs away (the original
+            # bank $00 $009832 max_insns blow-up), so the trial gates them out.
+            # When valid, enqueue so PC+2 is decoded and the post-pass keeps
+            # the BRK's fall-through successor (otherwise the handler tail —
+            # e.g. the PLP that restores M/X — is skipped and flags leak).
+            if sk == 'fall_brk':
+                if _brk_continuation_looks_valid(
+                        rom, (s.pc >> 16) & 0xFF, s.pc & 0xFFFF, s.m, s.x):
+                    if s not in graph.insns:
+                        worklist.append((s, sk, pc))
+                continue
             if s not in graph.insns:
                 worklist.append((s, sk, pc))
+
+    # BRK syscall-continuation resolution. Each BRK got a deferred 'fall_brk'
+    # successor to PC+2 (stored in its DecodedInsn.successors) that was never
+    # enqueued. Keep it only when PC+2 was independently decoded as reachable
+    # code (a branch/jump target landed there); otherwise the BRK is a guard
+    # followed by data — drop the successor so the BRK is a terminator and the
+    # decoder doesn't pull data in as code. Match by (pc, m, x) since PC+2 may
+    # have been decoded under a different p_stack history (dedupe collapses those).
+    _decoded_pcmx = {(k.pc, k.m, k.x) for k in graph.insns}
+    for _bkey, _bdi in list(graph.insns.items()):
+        if _bdi.insn.mnem == 'BRK' and _bdi.successors:
+            _s = _bdi.successors[0]
+            if (_s.pc, _s.m, _s.x) not in _decoded_pcmx:
+                graph.insns[_bkey] = DecodedInsn(key=_bkey, insn=_bdi.insn,
+                                                 successors=[])
 
     # PHP/PLP tracking causes the decoder to produce multiple DecodeKey
     # variants at the same (pc, m, x) when different p_stack histories
@@ -1876,6 +2042,13 @@ def analyze_function_exit_mx_modes(graph: 'FunctionDecodeGraph',
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            # An rts_dispatch (RTS-trick) RTS is NOT a function exit — it
+            # dispatches in-function to continuation labels in THIS graph,
+            # whose own terminal RTS is the real exit. Skip it so the
+            # mid-chain (m,x) (e.g. m=1 before the chain's $9195 REP back to
+            # m=0) is not folded into the exit meet.
+            if getattr(ins, 'dispatch_kind', None) == 'rts_trick':
+                continue
             modes.add((ins.m_flag & 1, ins.x_flag & 1))
             continue
         is_dispatch_term = (
@@ -1966,6 +2139,12 @@ def analyze_function_exit_mx(graph: 'FunctionDecodeGraph',
     for di in graph.insns.values():
         ins = di.insn
         if ins.mnem in ('RTS', 'RTL', 'RTI'):
+            # rts_dispatch (RTS-trick) RTS is an in-function dispatch, not an
+            # exit — its targets' own terminal RTS carries the true exit (m,x).
+            # Folding its mid-chain m=1 here would wrongly tell callers the
+            # function returns m=1 (re-breaking the post-call decode).
+            if getattr(ins, 'dispatch_kind', None) == 'rts_trick':
+                continue
             _accumulate(ins.m_flag & 1, ins.x_flag & 1)
             continue
         # Dispatch terminator: JSL/JML with no successors and a

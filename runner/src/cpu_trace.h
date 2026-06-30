@@ -28,6 +28,8 @@
 
 #include "types.h"
 #include "cpu_state.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -1313,7 +1315,317 @@ void cpu_trace_dump_wram(const char *tag, int scan_n);
 
 #else  /* SNESRECOMP_TRACE = 0 */
 
-static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24)            { (void)cpu; (void)pc24; }
+/* Lightweight always-on block-execution ring (works in non-trace builds).
+ * Records the last 1024 executed block PCs plus m-flag/X, dumped by the
+ * watchdog to reveal an infinite-loop's block cycle. */
+extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[]; extern unsigned g_ar_blk_idx;
+static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+  unsigned _i = g_ar_blk_idx++ & 1023u;
+  g_ar_blk_ring[_i] = pc24;
+  /* bit16 = m_flag, bit17 = x_flag (free bit, used by the AR_STACKPROV [overpop]
+   * dump to walk back to the block where x last flipped 0->1 = the x-leak site). */
+  g_ar_blk_aux[_i] = ((uint32_t)(cpu->x_flag & 1) << 17)
+                   | ((uint32_t)(cpu->m_flag & 1) << 16) | (cpu->X & 0xFFFFu);
+  { extern uint16_t g_ar_blk_s[]; g_ar_blk_s[_i] = cpu->S; }
+  { extern void ar_strace_block(uint32_t, uint16_t, int, int);
+    ar_strace_block(pc24, cpu->S, cpu->m_flag & 1, cpu->x_flag & 1); }
+  /* AR_XFLIP_GF=<game-frame>: the snes9x CPU-flag oracle (tools/oracle/diff_mx.py)
+   * names the exact game-frame where the recomp's x is wrong vs ground truth; this
+   * logs, DURING that $0088 frame, every block where x flips 0->1 (a SEP #$10/#$30
+   * or a PLP restoring x=1) plus the block before it -> the leak's exact site. The
+   * previous block's recorded x (aux bit17) vs this block's entry x gives the edge.
+   * Capped + deduped by the flipping block. Pairs with AR_DUMP_AT_GF=<same> for the
+   * call stack. Cheap when unarmed (one getenv-cached compare). */
+  {
+    static long xf_gf = -2;
+    if (xf_gf == -2) { const char *e = getenv("AR_XFLIP_GF"); xf_gf = e ? atol(e) : -1; }
+    if (xf_gf >= 0) {
+      extern uint8 g_ram[0x20000];
+      long gf = (long)((unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8));
+      /* Log a small WINDOW ending at the target (the crash frame): x persists
+       * across frame edges, so an unclosed SEP that leaks into the crash may be a
+       * few frames earlier. The per-line gf shows which frame each transition is on. */
+      if (gf >= xf_gf - 8 && gf <= xf_gf && g_ar_blk_idx >= 2) {
+        unsigned _p = (g_ar_blk_idx - 2u) & 1023u;   /* previous block */
+        int prev_x = (g_ar_blk_aux[_p] >> 17) & 1;
+        int cur_x = cpu->x_flag & 1;
+        if (prev_x != cur_x) {           /* x transition (either direction) */
+          /* Log the TRUE sequence (no dedup) so an UNCLOSED SEP #$10 on the fatal
+           * frame is visible: the last logged transition before the crash is the
+           * leak (an x 0->1 whose matching REP/PLP never ran). Cap high; if a
+           * loop floods it, the cap message says so. On a SURVIVED frame the
+           * transitions pair up (as at 6765); on the CRASH frame they don't. */
+          static int xn;
+          if (xn < 250) {
+            xn++;
+            extern const char *g_last_recomp_func;
+            fprintf(stderr, "[xflip] gf=%ld #%d  x %d->%d IN block $%06X (m=%u) "
+                    "-> next $%06X  func=%s\n", gf, xn, prev_x, cur_x,
+                    g_ar_blk_ring[_p], (g_ar_blk_aux[_p] >> 16) & 1, pc24,
+                    g_last_recomp_func ? g_last_recomp_func : "?");
+            if (xn == 250) fprintf(stderr, "[xflip] (cap 250 reached)\n");
+            fflush(stderr);
+          }
+        }
+      }
+    }
+  }
+  /* AR_XTRACE: continuously record x flips into the dedicated ring (dumped by
+   * ar_garbage_variant_trap at the first garbage dispatch). No frame target
+   * needed — it auto-captures the real fault path. Cheap (one getenv-cached
+   * compare + a store only on the rare frames where x actually toggles). */
+  {
+    static int xt_en = -1;
+    if (xt_en < 0) { extern int ar_xtrace_enabled(void); xt_en = ar_xtrace_enabled(); }
+    if (xt_en && g_ar_blk_idx >= 2) {
+      unsigned _p = (g_ar_blk_idx - 2u) & 1023u;
+      int prev_x = (g_ar_blk_aux[_p] >> 17) & 1;
+      int cur_x = cpu->x_flag & 1;
+      if (prev_x != cur_x) {
+        extern uint8 g_ram[0x20000];
+        extern void ar_xtrace_record(uint32_t blk, uint32_t nxt, int new_x, int m, uint32_t gf);
+        ar_xtrace_record(g_ar_blk_ring[_p], pc24, cur_x,
+                         (g_ar_blk_aux[_p] >> 16) & 1,
+                         (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8));
+      }
+    }
+  }
+  /* AR_SCHECK=1: pinpoint SNES stack-pointer corruption. The act->sim transition
+   * crashes with S walked to $2133 (the I/O register range) -> pushes/pops
+   * scribble hardware. ActRaiser legitimately relocates the stack to various
+   * low-RAM pages (saw S=$057F early), so only S >= $2000 (B-bus/I/O range, never
+   * a valid stack) is unambiguous corruption. Log the first such block with PC +
+   * function + block-history ring so we see which routine corrupted it. One-shot. */
+  {
+    static int s_en = -1;
+    if (s_en < 0) s_en = getenv("AR_SCHECK") ? 1 : 0;
+    if (s_en) {
+      extern int snes_frame_counter;
+      extern const char *g_last_recomp_func;
+      /* Track the high-water page of S. The leak walks S UP out of page 1 a
+       * little each frame; logging the function at each NEW high page reveals
+       * which per-frame routine leaks (it's the one that keeps reappearing as
+       * S climbs $02xx -> $03xx -> ...). Capped so a pathological run doesn't
+       * flood. First crossing also dumps the block-history path. */
+      static unsigned hi_page;       /* highest S>>8 seen above page 1 */
+      static int lines;
+      static int hist_done;          /* one-shot path dump at real corruption */
+      unsigned page = cpu->S >> 8;
+      if (page > 0x01 && page > hi_page && lines < 40) {
+        unsigned prev = hi_page; hi_page = page; lines++;
+        fprintf(stderr, "[scheck] S=$%04X page $%02X (was $%02X) pc=$%06X func=%s frame=%d\n",
+                cpu->S, page, prev, pc24, g_last_recomp_func ? g_last_recomp_func : "?", snes_frame_counter);
+        fflush(stderr);
+      }
+      /* Dump the block-history path at the IMPENDING UNDERFLOW. ActRaiser
+       * legitimately relocates its stack to high pages ($057F, and $1FFF via
+       * `LDA #$1FFF; TCS` at $03:9176 for the act->sim transition), so a high
+       * page is NOT corruption. The real bug is S draining all the way DOWN to
+       * ~$0000 and wrapping to $FFxx: runaway push recursion that never hits its
+       * matching stack restore ($7D1B). Catch it just before it wraps (S small)
+       * so the ring shows the recursing block, not the benign relocation. */
+      if (!hist_done && cpu->S < 0x0040) {
+        hist_done = 1;
+        fprintf(stderr, "[scheck] === S draining to $%04X (impending underflow) at pc=$%06X func=%s frame=%d; path: ===\n",
+                cpu->S, pc24, g_last_recomp_func ? g_last_recomp_func : "?", snes_frame_counter);
+        for (int k = 32; k >= 1; k--) {
+          unsigned idx = (g_ar_blk_idx - (unsigned)k) & 1023u;
+          fprintf(stderr, "    [-%2d] pc=$%06X m=%u X=$%04X\n", k,
+                  g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1, g_ar_blk_aux[idx] & 0xFFFF);
+        }
+        fflush(stderr);
+      }
+      /* Per-block S-delta tracer: a normal block moves S by only a few bytes
+       * (pushes/pulls, JSR/JSL). A jump > 0x100 is a TCS/TXS stack relocation
+       * OR the corruption. Logging every big jump (capped) names the exact
+       * block that moved S -> the corrupting one is the jump whose destination
+       * lands in a never-valid page. */
+      {
+        static unsigned prev_s = 0xFFFFFFFFu;
+        static int dlines;
+        if (prev_s != 0xFFFFFFFFu) {
+          int d = (int)cpu->S - (int)prev_s; if (d < 0) d = -d;
+          if (d > 0x100 && dlines < 30) {
+            dlines++;
+            fprintf(stderr, "[scheck-d] S $%04X->$%04X (d=%d) at pc=$%06X func=%s frame=%d\n",
+                    (unsigned)prev_s, cpu->S, d, pc24,
+                    g_last_recomp_func ? g_last_recomp_func : "?", snes_frame_counter);
+            fflush(stderr);
+          }
+        }
+        prev_s = cpu->S;
+      }
+    }
+  }
+  /* AR_B90D_CATCH: one-shot dump the instant B90D is entered with a small X
+   * (the OAM index from an object's $5E). That X feeds the abs,X copy loop
+   * whose counter-self-clobber causes the runaway; catching it here freezes
+   * the object table + regs BEFORE the loop scribbles memory. */
+  /* AR_896E_CATCH: track whether $8915's $896E PLP (the m-restore exit) runs
+   * each frame. When B127 is entered m=0 (the leak fired), report the last
+   * frame $896E ran vs now — if it didn't run this frame, the object loop was
+   * abandoned before its PLP (handler-return-miss). Also log the last handler
+   * target dispatched at $895C. */
+  {
+    extern int snes_frame_counter;
+    static int last_896e_frame = -1;
+    static unsigned last_handler = 0;
+    if (pc24 == 0x00896Eu) last_896e_frame = snes_frame_counter;
+    if (pc24 == 0x008966u) { /* loop continuation reached */ }
+    if (pc24 == 0x02B127u && (cpu->m_flag & 1) == 0) {
+      static int rep = 0;
+      if (!rep && getenv("AR_896E_CATCH")) {
+        rep = 1;
+        fprintf(stderr, "[896e] B127 m=0 at f=%d; last $896E(PLP) ran at f=%d  (%s this frame); last $895C handler target=$%04X\n",
+                snes_frame_counter, last_896e_frame,
+                last_896e_frame == snes_frame_counter ? "DID run" : "did NOT run",
+                last_handler);
+        fflush(stderr);
+      }
+    }
+    if (pc24 == 0x00895Cu) last_handler = cpu->X & 0xFFFF;
+  }
+  /* AR_BOSSLOG: trace the boss-music-load CPU control flow — the $00:A3xx/A4xx
+   * SPC command state machine and the $02:9964/$9A56 uploaders. Dedup repeated
+   * identical block PCs (spin loops) to one line, so we see the call ORDER:
+   * which command writes happen, whether $9A56 (the resident-uploader streamer)
+   * is actually entered after the $01, and where $A410 is reached from. */
+  if (getenv("AR_BOSSLOG")) {
+    int in_boss = (pc24 >= 0x00A3F0u && pc24 <= 0x00A470u);
+    int in_upld = (pc24 >= 0x029960u && pc24 <= 0x029B00u);
+    if (in_boss || in_upld) {
+      extern int snes_frame_counter;
+      extern uint8 g_ram[];
+      static uint32_t last_pc = 0xffffffffu;
+      if (pc24 != last_pc) {
+        last_pc = pc24;
+        unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+        fprintf(stderr, "[boss] f=%d gf=%u pc=%06X m=%d  ($12obj=%02x%02x)\n",
+                snes_frame_counter, gf, pc24, cpu->m_flag & 1,
+                g_ram[0x13], g_ram[0x12]);
+        fflush(stderr);
+      }
+    }
+  }
+  /* AR_EVTRACE: trace the post-miniboss event call chain to find where it breaks:
+   * bank_01_8000 -> $85BE (JSR $93A8) -> $85C1 (JSR $8A62 -> C3DA -> sets $034B). */
+  if (getenv("AR_EVTRACE")) {
+    switch (pc24) {
+      case 0x018000u: case 0x0185BEu: case 0x0185C1u: case 0x018A62u:
+      case 0x0193A8u: case 0x02C3DAu: {
+        extern int snes_frame_counter;
+        static unsigned long _n;
+        if (_n++ < 4000)
+          fprintf(stderr, "[evt] %06X f=%d m=%u\n", pc24, snes_frame_counter, cpu->m_flag & 1);
+        break;
+      }
+      default: break;
+    }
+  }
+  /* AR_STRACE: log cpu->S at each block of the slot9 falling-handler chain on
+   * the leak frame, to find where the stack unwinds one level too far (so the
+   * final RTS lands at $8078 instead of the $8966 loop continuation). */
+  {
+    extern int snes_frame_counter;
+    if (snes_frame_counter == 3566 && getenv("AR_STRACE")) {
+      switch (pc24) {
+        case 0x008915u: case 0x00895Cu: case 0x008661u: case 0x008631u:
+        case 0x008E2Fu: case 0x008F0Cu: case 0x008634u: case 0x008636u:
+        case 0x008664u: case 0x00A9D1u: case 0x0085B7u: case 0x008966u:
+        case 0x00896Eu: case 0x008078u: case 0x008FE7u:
+          fprintf(stderr, "[strace] %06X S=%04X m=%u X=%04X\n",
+                  pc24, cpu->S & 0xFFFF, cpu->m_flag & 1, cpu->X & 0xFFFF);
+          fflush(stderr);
+          break;
+        default: break;
+      }
+    }
+  }
+  /* AR_8664_CATCH: at $8664 (LDA $1E,X; PHA; RTS — the data-driven dispatch in
+   * the slot9 early-exit chain) on the leak frame, log X + the dispatch target
+   * ($1E,X) so we can tell if it legitimately points to the loop continuation
+   * or wrongly to $8077/$8078 (early-exit). DP=0 so $1E,X = $001E+X. */
+  if (pc24 == 0x008664u) {
+    extern int snes_frame_counter;
+    extern uint8 g_ram[0x20000];
+    if (snes_frame_counter >= 3560 && snes_frame_counter <= 3567 && getenv("AR_8664_CATCH")) {
+      unsigned a = (cpu->D + 0x001E + cpu->X) & 0xFFFF;
+      unsigned tgt = g_ram[a] | (g_ram[(a + 1) & 0xFFFF] << 8);
+      fprintf(stderr, "[8664] f=%d X=%04X $1E,X@%04X target=$%04X (RTS->$%04X) m=%u\n",
+              snes_frame_counter, cpu->X & 0xFFFF, a, tgt, (tgt + 1) & 0xFFFF, cpu->m_flag & 1);
+      fflush(stderr);
+    }
+  }
+  /* AR_8A3C_CATCH: at $8A3C entry (the routine right after $8915) on the
+   * frames around the leak, dump the tail of the block ring — the last thing
+   * $8915 did before returning. Diffing the good frame (m stays 1) vs the leak
+   * frame (m=0) reveals the divergent exit path. */
+  if (pc24 == 0x008A3Cu) {
+    extern int snes_frame_counter;
+    int f = snes_frame_counter;
+    if (f >= 3564 && f <= 3567 && getenv("AR_8A3C_CATCH")) {
+      fprintf(stderr, "[8a3c] entry f=%d m=%u — last 26 blocks:\n", f, cpu->m_flag & 1);
+      for (int n = 27; n >= 1; n--) {
+        unsigned idx = (g_ar_blk_idx - n) & 1023u;
+        uint32_t pc = g_ar_blk_ring[idx], aux = g_ar_blk_aux[idx];
+        fprintf(stderr, "    %06X m=%u X=%04X\n", pc, (aux >> 16) & 1, aux & 0xFFFF);
+      }
+      fflush(stderr);
+    }
+  }
+  /* AR_B127_CATCH: one-shot dump of the block-history ring the instant B127
+   * is entered with m=0 (the misdecode path that writes $1480 into the player
+   * status). The ring's per-block m-flag reveals where m flipped 1->0. */
+  if (pc24 == 0x02B127u && (cpu->m_flag & 1) == 0) {
+    static int b127done = 0;
+    if (!b127done && getenv("AR_B127_CATCH")) {
+      b127done = 1;
+      extern int snes_frame_counter;
+      fprintf(stderr, "[b127] m=0 entry at f=%d — scanning ring for m 1->0 flips:\n",
+              snes_frame_counter);
+      unsigned prev_m = 2;
+      for (int n = 1023; n >= 1; n--) {
+        unsigned idx = (g_ar_blk_idx - n) & 1023u;
+        uint32_t pc = g_ar_blk_ring[idx], aux = g_ar_blk_aux[idx];
+        unsigned mm = (aux >> 16) & 1;
+        if (prev_m == 1 && mm == 0) {
+          /* print a few blocks of context around the flip */
+          for (int j = n + 2; j >= n - 2 && j >= 1; j--) {
+            unsigned jx = (g_ar_blk_idx - j) & 1023u;
+            uint32_t jp = g_ar_blk_ring[jx], ja = g_ar_blk_aux[jx];
+            fprintf(stderr, "    [%4d] %06X m=%u X=%04X%s\n", j, jp,
+                    (ja >> 16) & 1, ja & 0xFFFF, (j == n) ? "  <-- 1->0 here" : "");
+          }
+          fprintf(stderr, "    ----\n");
+        }
+        prev_m = mm;
+      }
+      fflush(stderr);
+    }
+  }
+  if (pc24 == 0x02B90Du && (cpu->X & 0xFFFFu) < 0x0100u) {
+    static int done = 0;
+    if (!done && getenv("AR_B90D_CATCH")) {
+      done = 1;
+      extern uint8 g_ram[0x20000];
+      extern int snes_frame_counter;
+      fprintf(stderr, "[b90d] ENTER small X=%04X  A=%04X Y=%04X D=%04X DB=%02X f=%d\n",
+              cpu->X & 0xFFFF, cpu->A & 0xFFFF, cpu->Y & 0xFFFF, cpu->D & 0xFFFF,
+              cpu->DB, snes_frame_counter);
+      for (int s = 0; s < 16; s++) {
+        unsigned b = 0x06A0u + s * 0x40u;
+        unsigned sw = g_ram[b] | (g_ram[b+1] << 8);
+        if (sw == 0) continue;
+        fprintf(stderr, "[b90d] slot%-2d $%04X sw=%04X $12h=%02X%02X $5E=%02X%02X:",
+                s, b, sw, g_ram[b+0x13], g_ram[b+0x12],
+                g_ram[b+0x5f], g_ram[b+0x5e]);
+        for (int k = 0; k < 0x20; k++) fprintf(stderr, " %02X", g_ram[b+k]);
+        fprintf(stderr, "\n");
+      }
+      fflush(stderr);
+    }
+  }
+}
 static inline void cpu_trace_func_entry(CpuState *cpu, uint32_t pc24, const char *name) { (void)cpu; (void)pc24; (void)name; }
 static inline void cpu_trace_event(CpuState *cpu, uint32_t pc24, uint8_t et,
                                    uint8_t e0, uint16_t e1)                 { (void)cpu; (void)pc24; (void)et; (void)e0; (void)e1; }

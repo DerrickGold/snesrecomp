@@ -210,6 +210,22 @@ void dma_doDma(Dma* dma) {
     g_fail = true;
   }
 
+  {
+    static int dbg_dma_logged;
+    if (!dbg_dma_logged && !dma->channel[i].fromB
+        && dma->channel[i].aBank == 0x00
+        && dma->channel[i].aAdr >= 0x2100 && dma->channel[i].aAdr < 0x2200) {
+      dbg_dma_logged = 1;
+      extern const char *g_last_recomp_func;
+      fprintf(stderr, "[dma] BAD SRC chan=%d aBank=%02X aAdr=%04X bAdr=%02X "
+              "mode=%d size=%u fixed=%d dec=%d fromB=%d (last recomp: %s)\n",
+              i, dma->channel[i].aBank, dma->channel[i].aAdr,
+              dma->channel[i].bAdr, dma->channel[i].mode,
+              (unsigned)dma->channel[i].size, dma->channel[i].fixed,
+              dma->channel[i].decrement, dma->channel[i].fromB,
+              g_last_recomp_func ? g_last_recomp_func : "?");
+    }
+  }
   // do channel i
   dma_transferByte(
     dma, dma->channel[i].aAdr, dma->channel[i].aBank,

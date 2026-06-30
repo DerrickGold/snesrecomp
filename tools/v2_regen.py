@@ -1589,11 +1589,22 @@ def main() -> int:
                 continue
             ind_dispatch_map = None
             ind_list = getattr(cfg, 'indirect_dispatch', None) or []
-            if ind_list:
+            rts_list = getattr(cfg, 'rts_dispatch', None) or []
+            if ind_list or rts_list:
                 ind_dispatch_map = {}
                 for d in ind_list:
                     pc24 = (bank << 16) | (d['site_pc16'] & 0xFFFF)
                     ind_dispatch_map[pc24] = d
+                # rts_dispatch shares the same site_pc24-keyed map; an
+                # 'rts_trick' marker distinguishes it from the PHA/JMP/JSR
+                # indirect_dispatch entries (which key on mnemonic, so they
+                # can never collide with an RTS/RTL site). See decoder.py.
+                for d in rts_list:
+                    pc24 = (bank << 16) | (d['site_pc16'] & 0xFFFF)
+                    ind_dispatch_map[pc24] = {
+                        'rts_trick': True,
+                        'targets': tuple(d['targets']),
+                    }
             work_items.append({
                 'bank': bank,
                 'cfg': cfg,

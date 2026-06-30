@@ -55,6 +55,356 @@ uint8_t *IndirPtrDB(uint8 dp_addr, uint16 offs) {
 
 // Debug: recomp function call stack for watchdog diagnostics.
 const char *g_last_recomp_func = "(none)";
+
+/* Entry m/x invariant check — see cpu_state.h ar_entry_mx_check.
+ * Set from AR_MXCHECK env in the host setup (main.c). Default off. */
+int g_ar_mx_check = 0;
+
+/* ── Runtime m/x histogram + misdecode anomaly trap (AR_MXHIST) ─────────
+ * Records, per function-entry PC, how often it runs with each (m,x). A
+ * misdecode = a function running a variant it normally never runs (because
+ * m/x leaked), so once a PC is well-established with one dominant (m,x), the
+ * FIRST time it appears with a different (m,x) is flagged live. Unlike
+ * AR_MXCHECK (which only catches direct-call variant mismatches), this
+ * catches a wrongly-leaked RUNTIME flag — the actual misdecode trigger. */
+int g_ar_mxhist = 0;
+typedef struct { uint32_t pc; uint32_t cnt[4]; uint8_t flagged; } MxHistEnt;
+#define MXHIST_CAP 32768u
+static MxHistEnt g_mxhist[MXHIST_CAP];
+#define MXHIST_WARMUP 64u   /* dominant combo must have ≥ this many hits first */
+
+void ar_mxhist_record(uint32_t pc24, int m, int x) {
+  unsigned combo = ((unsigned)(m & 1) << 1) | (unsigned)(x & 1);
+  unsigned h = (pc24 * 2654435761u) & (MXHIST_CAP - 1u);
+  MxHistEnt *e = 0;
+  for (unsigned i = 0; i < MXHIST_CAP; i++) {
+    unsigned j = (h + i) & (MXHIST_CAP - 1u);
+    if (g_mxhist[j].pc == pc24) { e = &g_mxhist[j]; break; }
+    if (g_mxhist[j].pc == 0u) { g_mxhist[j].pc = pc24; e = &g_mxhist[j]; break; }
+  }
+  if (!e) return;  /* table full — give up silently */
+  if (!e->flagged && e->cnt[combo] == 0u) {
+    unsigned dom = 0, domn = 0;
+    for (int c = 0; c < 4; c++) if (e->cnt[c] > domn) { domn = e->cnt[c]; dom = (unsigned)c; }
+    if (domn >= MXHIST_WARMUP && dom != combo) {
+      e->flagged = 1;
+      extern int snes_frame_counter;
+      extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+      const char *caller = (g_recomp_stack_top >= 2)
+                         ? g_recomp_stack[g_recomp_stack_top - 2] : "(top)";
+      fprintf(stderr,
+        "[mxhist] MISDECODE? %06X ran m=%d x=%d (1st time) after m=%u x=%u x%u  f=%d caller=%s\n",
+        pc24, m & 1, x & 1, (dom >> 1) & 1, dom & 1, domn, snes_frame_counter,
+        caller ? caller : "?");
+      fflush(stderr);
+    }
+  }
+  e->cnt[combo]++;
+}
+
+void ar_mxhist_dump(void) {
+  if (!g_ar_mxhist) return;
+  int n = 0;
+  fprintf(stderr, "[mxhist] === PCs that ran with >1 (m,x) combo (possible misdecodes) ===\n");
+  for (unsigned j = 0; j < MXHIST_CAP; j++) {
+    if (!g_mxhist[j].pc) continue;
+    int nz = 0; unsigned tot = 0, mn = 0xFFFFFFFFu, mx = 0;
+    for (int c = 0; c < 4; c++) { unsigned v = g_mxhist[j].cnt[c]; if (v) { nz++; tot += v; if (v < mn) mn = v; if (v > mx) mx = v; } }
+    if (nz < 2) continue;
+    /* lopsided split (minority < 2% of majority) = strong misdecode signal */
+    int lop = (mx >= 50u && mn * 50u < mx);
+    fprintf(stderr, "[mxhist] %06X  M0X0=%u M0X1=%u M1X0=%u M1X1=%u%s\n",
+      g_mxhist[j].pc, g_mxhist[j].cnt[0], g_mxhist[j].cnt[1],
+      g_mxhist[j].cnt[2], g_mxhist[j].cnt[3], lop ? "   <== LOPSIDED" : "");
+    n++;
+  }
+  fprintf(stderr, "[mxhist] %d multi-combo PCs\n", n);
+  fflush(stderr);
+}
+
+/* AR_TRAPFN=<substring>: the first time a function whose name contains the
+ * substring is entered, dump the full recomp call stack (top -> bottom) plus
+ * the runtime m/x flags. Used to find the dispatch chain that reached a
+ * known-garbage misdecode variant (e.g. AR_TRAPFN=bank_03_AC8E_M1X0) -> the
+ * caller between the legit entry and the wrong-m variant is the leak site. */
+const char *g_ar_trapfn = 0;
+void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32_t pc24) {
+  if (!g_ar_trapfn || !fn || !strstr(fn, g_ar_trapfn)) return;
+  static int done;
+  if (done) return;
+  done = 1;
+  extern int snes_frame_counter;
+  extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+  fprintf(stderr, "[trapfn] ENTER %s (%06X) m=%u x=%u frame=%d  call stack (top->bottom):\n",
+          fn, pc24, cpu->m_flag & 1, cpu->x_flag & 1, snes_frame_counter);
+  for (int i = g_recomp_stack_top - 1; i >= 0; i--)
+    fprintf(stderr, "    [%2d] %s\n", i, g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+  /* Block-history ring (pc + m at each block): the trap fires BEFORE the
+   * misdecode loop floods the ring, so this shows the path into the entry,
+   * with the m-flag at each block -> pinpoints the block where m flipped. */
+  extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[]; extern unsigned g_ar_blk_idx;
+  fprintf(stderr, "  block path (pc, m):\n");
+  for (int k = 40; k >= 1; k--) {
+    unsigned idx = (g_ar_blk_idx - (unsigned)k) & 1023u;
+    fprintf(stderr, "    [-%2d] pc=$%06X m=%u\n", k,
+            g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1);
+  }
+  fflush(stderr);
+}
+
+/* Garbage-variant dispatch trap (default ON). The emitter marks a function
+ * variant as GARBAGE when its decode contains a split-immediate BRK — a BRK
+ * that arose from decoding a 16-bit immediate at the wrong (narrow) width, which
+ * a valid sibling variant decodes as one instruction (e.g. bank_03_97B0_M1X0's
+ * `LDA #$0007` -> `LDA #$07` + `BRK`). Such a variant is NEVER legitimately
+ * reached: entering it means a leaked m/x flag dispatched us into a misdecode.
+ * The emitter calls this at the variant's entry, so it fires at the EXACT
+ * dispatch where the leak first sends control wrong — far closer to the root
+ * than the eventual downstream crash, and with no oracle needed. Logs the caller
+ * + runtime m/x + frame; dedup per (caller,fn), capped. AR_GARBAGE_STACK=1 adds
+ * the recomp call stack + block ring; AR_GARBAGE_ABORT=1 aborts on first hit;
+ * AR_NOGARBAGEWARN=1 silences. See DEBUG.md "garbage-variant trap". */
+void ar_garbage_variant_trap(CpuState *cpu, const char *fn, uint32_t pc24) {
+  static int en = -1, full = -1, doabort = -1;
+  if (en < 0) en = getenv("AR_NOGARBAGEWARN") ? 0 : 1;
+  if (!en) return;
+  if (full < 0) full = getenv("AR_GARBAGE_STACK") ? 1 : 0;
+  if (doabort < 0) doabort = getenv("AR_GARBAGE_ABORT") ? 1 : 0;
+  extern int snes_frame_counter;
+  extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+  const char *caller = (g_recomp_stack_top >= 2)
+                     ? g_recomp_stack[g_recomp_stack_top - 2] : "(top/dispatch)";
+  /* dedup per (caller, fn) string-literal pair, capped */
+  static const void *seen_c[256]; static const void *seen_f[256];
+  static int nseen, capped;
+  for (int i = 0; i < nseen; i++)
+    if (seen_c[i] == caller && seen_f[i] == fn) return;
+  if (nseen < 256) { seen_c[nseen] = caller; seen_f[nseen] = fn; nseen++; }
+  else if (!capped) { capped = 1;
+    fprintf(stderr, "[garbage-variant] (cap 256 reached; further unique sites "
+                    "suppressed)\n"); fflush(stderr); return; }
+  else return;
+  fprintf(stderr,
+    "[garbage-variant] entered MISDECODE variant %s (%06X) m=%u x=%u f=%d — a "
+    "leaked flag dispatched here from caller=%s. (This variant's decode is "
+    "garbage; the flag went wrong AT or just before this dispatch.)\n",
+    fn, pc24, cpu->m_flag & 1, cpu->x_flag & 1, snes_frame_counter, caller);
+  if (full) {
+    for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 12; i--)
+      fprintf(stderr, "[garbage-variant]   [%2d] %s\n", i,
+              g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+    extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[]; extern unsigned g_ar_blk_idx;
+    for (int k = 24; k >= 1; k--) {
+      unsigned idx = (g_ar_blk_idx - (unsigned)k) & 1023u;
+      fprintf(stderr, "[garbage-variant]   [-%2d] pc=$%06X m=%u\n", k,
+              g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1);
+    }
+  }
+  /* AR_XTRACE: dump the x-flip history leading INTO this garbage dispatch. Fire
+   * on the FIRST garbage variant entered with x=1 (the x-leak ones, e.g. AFF8/
+   * A087 at M1X1) — the first garbage ($8029) is at x=0, the x 0->1 leak happens
+   * just after it, so capturing at the first x=1 garbage shows that transition.
+   * The last x 0->1 with no closing 1->0 is the leak that picked the wrong-x
+   * variant. Fires once, at the real fault — no frame guessing. */
+  {
+    extern int ar_xtrace_enabled(void);
+    extern void ar_xtrace_dump(const char *why, int n);
+    static int dumped;
+    if (ar_xtrace_enabled() && !dumped && (cpu->x_flag & 1)) {
+      dumped = 1; ar_xtrace_dump(fn, 48);
+      /* Also dump the block ring WITH per-block S, back far enough to span the
+       * enclosing routine's (B21F) call chain — watch S drift across a call to
+       * find the subroutine that returns with S off (corrupting B21F's PLP ->
+       * the x-leak). The flip site is a PLP; the cause is an unbalanced call. */
+      extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[];
+      extern uint16_t g_ar_blk_s[]; extern unsigned g_ar_blk_idx;
+      fprintf(stderr, "[xtrace] === block+S history into %s (oldest-first; watch "
+              "S jump across a call; the B21F blocks $03B2xx mark each call's "
+              "return) ===\n", fn);
+      for (int k = 200; k >= 1; k--) {
+        unsigned idx = (g_ar_blk_idx - (unsigned)k) & 1023u;
+        fprintf(stderr, "[xtrace]   %06X m=%u x=%u S=%04X\n",
+                g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1,
+                (g_ar_blk_aux[idx] >> 17) & 1, g_ar_blk_s[idx]);
+      }
+    }
+  }
+  fflush(stderr);
+  if (doabort) { extern void abort(void); abort(); }
+}
+
+void ar_entry_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32_t pc24) {
+  /* Rate-limit: report each distinct function at most once, cap total, so a
+   * hot mis-typed call can't flood. The first occurrence per site is what
+   * matters (the emitter's static m/x analysis was wrong entering `fn`). */
+  static const char *seen[256];
+  static unsigned nseen = 0;
+  static unsigned total = 0;
+  for (unsigned i = 0; i < nseen; i++)
+    if (seen[i] == fn) return;            /* same string literal -> already reported */
+  if (nseen < 256) seen[nseen++] = fn;
+  if (total++ >= 2000) return;
+  /* Caller = one below the just-pushed current function on the recomp stack. */
+  extern const char *g_recomp_stack[];
+  extern int g_recomp_stack_top;
+  const char *caller = (g_recomp_stack_top >= 2)
+                     ? g_recomp_stack[g_recomp_stack_top - 2] : "(top/dispatch)";
+  fprintf(stderr,
+    "[mxcheck] %s (%06X) entered with m=%u x=%u but variant expects m=%d x=%d"
+    "  (caller=%s)\n",
+    fn, pc24, cpu->m_flag & 1, cpu->x_flag & 1, em, ex,
+    caller ? caller : "?");
+  fflush(stderr);
+}
+
+/* Always-on lightweight block-PC ring (works in non-trace builds, where
+ * cpu_trace.c's ring is absent). Written by the inline cpu_trace_block;
+ * read by the watchdog dump to reveal an infinite-loop's block cycle. */
+#define AR_BLK_RING 1024
+uint32_t g_ar_blk_ring[AR_BLK_RING];
+uint32_t g_ar_blk_aux[AR_BLK_RING];   /* (x_flag<<17) | (m_flag<<16) | (X & 0xFFFF) */
+uint16_t g_ar_blk_s[AR_BLK_RING];     /* cpu->S at each block entry (stack-drift trace) */
+unsigned g_ar_blk_idx = 0;
+
+int ar_block_history(uint32_t *out, int max) {
+  if (max > AR_BLK_RING) max = AR_BLK_RING;
+  unsigned total = g_ar_blk_idx;
+  int n = (total < (unsigned)max) ? (int)total : max;
+  for (int i = 0; i < n; i++)
+    out[i] = g_ar_blk_ring[(g_ar_blk_idx - n + i) & (AR_BLK_RING - 1)];
+  return n;
+}
+
+/* AR_XTRACE: dedicated x-flag-transition ring. Records ONLY the blocks where x
+ * flips (so 512 entries span a huge slice of execution, unlike the per-block
+ * ring), then dumps automatically the instant a garbage variant is entered
+ * (ar_garbage_variant_trap) — capturing the REAL fatal path's x history with no
+ * frame-number guessing. The block recorded is where the flip happened (a
+ * SEP/REP #$10/#$30, or a PLP/RTI restoring x from the stack); reading the gen
+ * for that block tells us SEP-leak (skipped REP) vs PLP-leak (bad stack byte). */
+#define AR_XTR_RING 512
+static uint32_t g_xtr_blk[AR_XTR_RING];   /* block PC where the flip occurred */
+static uint32_t g_xtr_nxt[AR_XTR_RING];   /* the following block PC */
+static uint32_t g_xtr_gf[AR_XTR_RING];    /* game-frame $0088 */
+static uint8_t  g_xtr_dir[AR_XTR_RING];   /* new x value (0 or 1) */
+static uint8_t  g_xtr_m[AR_XTR_RING];     /* m at the flip block */
+static unsigned g_xtr_idx;
+
+int ar_xtrace_enabled(void) {
+  static int e = -1;
+  if (e < 0) e = getenv("AR_XTRACE") ? 1 : 0;
+  return e;
+}
+
+void ar_xtrace_record(uint32_t blk, uint32_t nxt, int new_x, int m, uint32_t gf) {
+  unsigned i = g_xtr_idx++ & (AR_XTR_RING - 1);
+  g_xtr_blk[i] = blk; g_xtr_nxt[i] = nxt; g_xtr_gf[i] = gf;
+  g_xtr_dir[i] = (uint8_t)new_x; g_xtr_m[i] = (uint8_t)m;
+}
+
+/* Dump the last `n` x-transitions (newest last). Called from the garbage trap. */
+void ar_xtrace_dump(const char *why, int n) {
+  if (g_xtr_idx == 0) { fprintf(stderr, "[xtrace] (%s) no x flips recorded\n", why);
+    return; }
+  if (n > AR_XTR_RING) n = AR_XTR_RING;
+  if ((unsigned)n > g_xtr_idx) n = (int)g_xtr_idx;
+  fprintf(stderr, "[xtrace] === x-flip history into %s (newest last; the last "
+          "0->1 with no closing 1->0 is the leak) ===\n", why);
+  for (int k = n; k >= 1; k--) {
+    unsigned i = (g_xtr_idx - (unsigned)k) & (AR_XTR_RING - 1);
+    fprintf(stderr, "[xtrace]   gf=%u  x ->%d  IN block $%06X (m=%u) -> $%06X\n",
+            g_xtr_gf[i], g_xtr_dir[i], g_xtr_blk[i], g_xtr_m[i], g_xtr_nxt[i]);
+  }
+  fflush(stderr);
+}
+
+/* AR_STACKPROV: stack pusher-provenance shadow array. For each bank-0 stack
+ * byte address, record the recomp block-PC that last PUSHED there. Lets a
+ * bad-RTS / dispatch-miss name the function whose push left the corrupt return
+ * frame — or, if a slot reads back NEVER-PUSHED, reveal that S is pointing at
+ * stale memory it never wrote (wrong-S relocation, not a bad push). The two
+ * cases need opposite fixes, so distinguishing them is the whole point.
+ * Runner-only, gated, ~256KB. Written from cpu_write8's push heuristic
+ * (bank==0 && addr==cpu->S, before the S decrement); read at the dispatch-miss. */
+uint32_t g_stack_pusher[0x10000];
+unsigned g_stack_pusher_frame[0x10000];
+
+/* AR_STRACE: instruction-granular cpu->S trace scoped to a PC window (default the
+ * B20C/B21F loop $03B200..$03B260). Logs every stack push/pop (from cpu_write8/
+ * read8) + every block entry, with cpu->S, so the EXACT micro-op where S drifts
+ * +1 across a loop iteration is visible (block-level tracing can't see it).
+ * Capped. Window overridable via AR_STRACE_LO/HI (hex). */
+static int      g_strace_en = -1;
+static uint32_t g_strace_lo, g_strace_hi;
+static int      g_strace_n;
+static int ar_strace_setup(void) {
+  if (g_strace_en < 0) {
+    g_strace_en = getenv("AR_STRACE") ? 1 : 0;
+    const char *l = getenv("AR_STRACE_LO"); g_strace_lo = l ? (uint32_t)strtoul(l, 0, 16) : 0x03B200u;
+    const char *h = getenv("AR_STRACE_HI"); g_strace_hi = h ? (uint32_t)strtoul(h, 0, 16) : 0x03B260u;
+  }
+  return g_strace_en;
+}
+/* True when the currently-executing block (newest ring entry) is in the window. */
+int ar_strace_active(void) {
+  if (!ar_strace_setup() || g_strace_n >= 400 || g_ar_blk_idx == 0) return 0;
+  uint32_t pc = g_ar_blk_ring[(g_ar_blk_idx - 1u) & (AR_BLK_RING - 1)];
+  return pc >= g_strace_lo && pc <= g_strace_hi;
+}
+void ar_strace_op(const char *kind, uint16_t addr, uint8_t val, uint16_t s) {
+  uint32_t pc = g_ar_blk_ring[(g_ar_blk_idx - 1u) & (AR_BLK_RING - 1)];
+  fprintf(stderr, "[strace]   %-4s $%04X = $%02X   S=%04X  (in $%06X)\n",
+          kind, addr, val, s, pc);
+  if (++g_strace_n == 400) fprintf(stderr, "[strace] (cap 400)\n");
+  fflush(stderr);
+}
+/* Block-entry marker (called from cpu_trace_block when in window). */
+void ar_strace_block(uint32_t pc24, uint16_t s, int m, int x) {
+  if (!ar_strace_setup() || g_strace_n >= 400) return;
+  if (pc24 < g_strace_lo || pc24 > g_strace_hi) return;
+  fprintf(stderr, "[strace] BLOCK $%06X  S=%04X m=%u x=%u\n", pc24, s, m, x);
+  if (++g_strace_n == 400) fprintf(stderr, "[strace] (cap 400)\n");
+  fflush(stderr);
+}
+
+int ar_stackprov_enabled(void) {
+  static int e = -1;
+  if (e < 0) e = getenv("AR_STACKPROV") ? 1 : 0;
+  return e;
+}
+
+int ar_block_history2(uint32_t *pc, uint32_t *aux, int max) {
+  if (max > AR_BLK_RING) max = AR_BLK_RING;
+  unsigned total = g_ar_blk_idx;
+  int n = (total < (unsigned)max) ? (int)total : max;
+  for (int i = 0; i < n; i++) {
+    unsigned k = (g_ar_blk_idx - n + i) & (AR_BLK_RING - 1);
+    pc[i] = g_ar_blk_ring[k];
+    aux[i] = g_ar_blk_aux[k];
+  }
+  return n;
+}
+
+/* Same as ar_block_history2 but also returns cpu->S per block — lets the diag
+ * dump show stack drift across a call chain (find the subroutine that returns
+ * with S off, corrupting a later PLP). */
+int ar_block_history3(uint32_t *pc, uint32_t *aux, uint16_t *s, int max) {
+  if (max > AR_BLK_RING) max = AR_BLK_RING;
+  unsigned total = g_ar_blk_idx;
+  int n = (total < (unsigned)max) ? (int)total : max;
+  for (int i = 0; i < n; i++) {
+    unsigned k = (g_ar_blk_idx - n + i) & (AR_BLK_RING - 1);
+    pc[i] = g_ar_blk_ring[k];
+    aux[i] = g_ar_blk_aux[k];
+    s[i] = g_ar_blk_s[k];
+  }
+  return n;
+}
+
+/* Software-interrupt (BRK/COP) hooks — see cpu_state.h. NULL by default; the
+ * game installs a handler. Generated code calls these at BRK/COP sites. */
+void (*g_cpu_brk_hook)(CpuState *cpu) = 0;
+void (*g_cpu_cop_hook)(CpuState *cpu) = 0;
 // Tier 1.5 call-trace depth cap. Originally 16; bumped to 64 because
 // SMW peak call depth is ~10 but Tier 1.5 attribution silently
 // degrades past the cap (g_last_recomp_func and parent fields go
@@ -63,6 +413,28 @@ const char *g_last_recomp_func = "(none)";
 #define RECOMP_STACK_DEPTH 64
 const char *g_recomp_stack[RECOMP_STACK_DEPTH];
 int g_recomp_stack_top = 0;
+unsigned long g_recomp_push_count = 0;  /* total function entries; per-frame work meter */
+int g_trace_one_frame = 0;  /* AR_CTACTION: trace exactly one inter-yield batch */
+int g_ct_arm_request = 0;   /* set when 8465_M0X0 seen; WaitForVblank arms next batch */
+
+/* AR_CTACTION batch buffer: buffer each inter-yield batch's call trace and flush
+ * only the batch that contains 8465_M0X0 — captures the exact m=1->0 corrupting
+ * frame from its start. Reset/flushed by RecompBatchYield() at each vblank. */
+static char g_batch_buf[256 * 1024];
+static int  g_batch_len;
+static int  g_batch_had_8465;
+static int  g_batch_done;   /* once we've flushed the corrupting batch, stop */
+
+void RecompBatchYield(void) {
+  if (!getenv("AR_CTACTION") || g_batch_done) return;
+  if (g_batch_had_8465) {
+    fwrite(g_batch_buf, 1, (size_t)g_batch_len, stderr);
+    fprintf(stderr, "[1f] flushed corrupting batch (%d bytes)\n", g_batch_len);
+    g_batch_done = 1;
+  }
+  g_batch_len = 0;
+  g_batch_had_8465 = 0;
+}
 
 /* Per-frame 65816 stack-entry level (cpu->S at function entry), parallel
  * to g_recomp_stack and indexed by the same g_recomp_stack_top. The
@@ -73,6 +445,15 @@ int g_recomp_stack_top = 0;
  * decrement contract. See ISSUES.md "shared-tail multi-level non-local
  * return" (the fish-explosion OAM wipe). */
 uint16_t g_cpu_entry_s[RECOMP_STACK_DEPTH];
+/* Parallel to g_cpu_entry_s: whether each frame was entered via a paired
+ * host-C caller (hrv=1, i.e. a real JSR/JSL with a C return) vs a tail/
+ * dispatch (hrv=0). A return-to-ancestor SKIP must NOT unwind past a paired-
+ * host-caller frame — that frame owes its C caller a normal return, so a skip
+ * crossing it corrupts control flow (e.g. ActRaiser action-stage object loop
+ * $8915 emitting SKIP_11 that escaped its 82E2 JSR caller and blew past the
+ * $82D1 fade-in loop -> black playfield). cpu_resolve_ancestor_skip stops the
+ * scan at the nearest such boundary. */
+uint8_t g_cpu_entry_hrv[RECOMP_STACK_DEPTH];
 static uint8_t g_tailcall_context_valid;
 static uint16_t g_tailcall_entry_s;
 static uint8_t g_tailcall_hrv;
@@ -91,6 +472,21 @@ int cpu_take_tailcall_return_context(uint16_t *entry_s, uint8_t *hrv) {
   return 1;
 }
 
+/* Trampoline: a dispatched frame (hrv=0) stashes its next computed-jump target
+ * here and returns RECOMP_RETURN_TAILCALL; the cpu_dispatch_pc_from driving loop
+ * consumes it and iterates instead of nesting. Set immediately before the
+ * TAILCALL return and consumed immediately by the loop (no yield in between),
+ * so a single global trio is safe (re-entrant NMI dispatch fully completes
+ * before the main chain resumes). */
+uint32_t g_tailcall_pc24;
+uint16_t g_tailcall_miss_s;
+uint32_t g_tailcall_src24;
+void cpu_tailcall_request(uint32_t pc24, uint16_t miss_s, uint32_t src24) {
+  g_tailcall_pc24 = pc24 & 0xFFFFFFu;
+  g_tailcall_miss_s = miss_s;
+  g_tailcall_src24 = src24 & 0xFFFFFFu;
+}
+
 int cpu_resolve_ancestor_skip(uint16_t ret_s) {
   /* The current (top-1) frame is the one whose RTS we are resolving; it
    * is NOT a match (its entry_s != ret_s, else the balanced host-return
@@ -102,8 +498,41 @@ int cpu_resolve_ancestor_skip(uint16_t ret_s) {
    * in behavior). */
   int top = g_recomp_stack_top;
   if (top < 2 || top > RECOMP_STACK_DEPTH) return -1;
+  /* Reconstruct the RTS return PC from the SNES stack (same math as the
+   * generated callsite) so the log shows WHERE the loop is trying to return. */
+  extern uint8 g_ram[0x20000];
+  uint16 _rpcl = g_ram[(uint16)(ret_s + 1)];
+  uint16 _rpch = g_ram[(uint16)(ret_s + 2)];
+  uint16 _rpc  = (uint16)((((_rpch << 8) | _rpcl) + 1) & 0xFFFFu);
   for (int i = top - 2; i >= 0; i--) {
-    if (g_cpu_entry_s[i] == ret_s) return (top - 1) - i;
+    if (g_cpu_entry_s[i] == ret_s) {
+      int dist = (top - 1) - i;
+      if (dist >= 2 && getenv("AR_ANCLOG")) {
+        extern const char *g_recomp_stack[];
+        extern int snes_frame_counter;
+        static int n;
+        if (n++ < 80) {
+          fprintf(stderr, "[anc] skip=%d retpc=%04x target[%d]=%s (top-1)=%s hrv@tgt=%u f=%d | stk:",
+                  dist, _rpc, i, g_recomp_stack[i] ? g_recomp_stack[i] : "?",
+                  g_recomp_stack[top-1] ? g_recomp_stack[top-1] : "?",
+                  (unsigned)g_cpu_entry_hrv[i], snes_frame_counter);
+          for (int j = top - 1; j >= 0 && j >= top - 12; j--)
+            fprintf(stderr, " [%d]%s@%04x", j, g_recomp_stack[j] ? g_recomp_stack[j] : "?",
+                    g_cpu_entry_s[j]);
+          fprintf(stderr, "\n");
+        }
+      }
+      return dist;
+    }
+  }
+  if (getenv("AR_ANCLOG")) {
+    extern const char *g_recomp_stack[];
+    extern int snes_frame_counter;
+    static int nm;
+    if (nm++ < 40)
+      fprintf(stderr, "[anc] NO-MATCH retpc=%04x ret_s=%04x (top-1)=%s top=%d f=%d\n",
+              _rpc, ret_s, g_recomp_stack[top-1] ? g_recomp_stack[top-1] : "?",
+              top, snes_frame_counter);
   }
   return -1;
 }
@@ -145,6 +574,140 @@ const recomp_snap_entry* recomp_snap_lookup(int call_idx) {
 }
 
 void RecompStackPush(const char *name) {
+  /* AR_CALLTRACE entry log: pairs with the exit log in RecompStackPop. Net
+   * (exitS - entryS) per call = +2 for a balanced JSR fn, +3 for JSL; any
+   * other value is a stack-imbalanced (leaking) generated function. */
+  {
+    static int ctp = -2;
+    if (ctp == -2) { const char *e = getenv("AR_CALLTRACE"); ctp = e ? atoi(e) : -1; }
+    if (ctp >= 0) {
+      extern int snes_frame_counter; extern CpuState g_cpu; extern uint8 g_ram[];
+      static long ctpgf = -2;
+      if (ctpgf == -2) { const char *e = getenv("AR_CALLTRACE_GF"); ctpgf = e ? atol(e) : -1; }
+      unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+      if (snes_frame_counter >= ctp && snes_frame_counter <= ctp + 4 &&
+          (ctpgf < 0 || (long)gf == ctpgf))
+        fprintf(stderr, "[ctPUSH S=%04x m=%u] %*s>%s\n", g_cpu.S, (unsigned)g_cpu.m_flag,
+                g_recomp_stack_top * 2, "", name ? name : "?");
+    }
+  }
+  // TEMP DIAGNOSTIC: tripwires for the action-level fade-freeze investigation.
+  //   AR_TRAP8465 — fire when the misdecoded bank_00_8465_M0X0 (BRK stub that
+  //                 never pops its return frame) is entered: dump frame, cpu->S,
+  //                 m/x, and the full recomp call stack (innermost first). This
+  //                 should NEVER run in a correct game; it's the smoking gun.
+  //   Also counts entries into bank_00_8966 (the new computed-jump continuation
+  //                 dispatch entry) to confirm the fix path is exercised.
+  if ((getenv("AR_TRAP8465") || getenv("AR_CTACTION")) && name
+      && strcmp(name, "bank_00_8465_M0X0") == 0) {
+    extern int snes_frame_counter;
+    g_ct_arm_request = 1;   /* ask WaitForVblank to trace the NEXT full batch */
+    static int once;
+    if (!once) {
+      once = 1;
+      fprintf(stderr, "[trap] *** bank_00_8465_M0X0 (BRK misdecode) entered f=%d top=%d ***\n",
+              snes_frame_counter, g_recomp_stack_top);
+      for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 12; i--)
+        fprintf(stderr, "[trap]   [%d] %s\n", i, g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+    }
+  }
+  // TEMP DIAGNOSTIC: AR_92CBLOG — when the level object-stream rebuild $92CB
+  // runs, log the section key it loads: cpu->D, cpu->DB, and the 16-bit
+  // [$7E:D+$18] compared against the $B100 index table. Lets us see whether the
+  // recomp loads a different section than the oracle (28 vs 49 objects).
+  if (getenv("AR_92CBLOG") && name && strncmp(name, "bank_00_92CB", 12) == 0) {
+    extern int snes_frame_counter;
+    extern CpuState g_cpu;
+    extern uint8 g_ram[];
+    uint32 a = (uint32)((g_cpu.D + 0x18) & 0x1ffff);
+    unsigned key = (unsigned)g_ram[a] | ((unsigned)g_ram[(a + 1) & 0x1ffff] << 8);
+    fprintf(stderr, "[92cb] f=%d D=%04x DB=%02x [$7E:D+18]=%04x  ($7E0018=%04x)\n",
+            snes_frame_counter, g_cpu.D, g_cpu.DB, key,
+            (unsigned)g_ram[0x18] | ((unsigned)g_ram[0x19] << 8));
+  }
+  // TEMP DIAGNOSTIC: AR_SPAWNLOG — log X (grid slot) at the object-spawn /
+  // slot-init routines, to see which slot each spawn targets and whether the
+  // free-slot pointer advances. The terminator dies because spawns keep hitting
+  // the same slot ($11E0) without advancing it.
+  if (getenv("AR_SPAWNLOG") && name) {
+    extern int snes_frame_counter;
+    extern CpuState g_cpu;
+    extern uint8 g_ram[];
+    const char *m = NULL;
+    if (strncmp(name, "bank_00_A758", 12) == 0) m = "A758";
+    else if (strncmp(name, "bank_00_85B7", 12) == 0) m = "85B7(init $4000)";
+    else if (strncmp(name, "bank_02_B127", 12) == 0) m = "B127";
+    /* AR_MLOG: log entry m-flag of the 82E2 sub-call chain to localize the
+     * m=0 leak that makes B127 misdecode (needs m=1). */
+    if (getenv("AR_MLOG") && (strncmp(name, "bank_00_845F", 12) == 0 ||
+        strncmp(name, "bank_00_8915", 12) == 0 || strncmp(name, "bank_02_B030", 12) == 0 ||
+        strncmp(name, "bank_02_B091", 12) == 0 || strncmp(name, "bank_02_B127", 12) == 0)) {
+      extern int snes_frame_counter;
+      unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+      if (gf >= 1900 && gf <= 1918)
+        fprintf(stderr, "[mlog] gf=%u %-20s entry m=%u x=%u S=%04x\n", gf, name,
+                (unsigned)g_cpu.m_flag, (unsigned)g_cpu.x_flag, g_cpu.S);
+    }
+    if (m && strcmp(m, "B127") == 0)
+      fprintf(stderr, "[b127] entry name=%s m=%u x=%u caller=%s caller2=%s\n",
+              name, (unsigned)g_cpu.m_flag, (unsigned)g_cpu.x_flag,
+              g_recomp_stack_top >= 1 && g_recomp_stack[g_recomp_stack_top-1] ? g_recomp_stack[g_recomp_stack_top-1] : "?",
+              g_recomp_stack_top >= 2 && g_recomp_stack[g_recomp_stack_top-2] ? g_recomp_stack[g_recomp_stack_top-2] : "?");
+    if (m) fprintf(stderr, "[spawn] gf=%u f=%d %-16s X=%04x A=%04x Y=%04x  $008a=%04x $00cc=%04x\n",
+                   (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8),
+                   snes_frame_counter, m, g_cpu.X, g_cpu.A, g_cpu.Y,
+                   (unsigned)g_ram[0x8a] | ((unsigned)g_ram[0x8b] << 8),
+                   (unsigned)g_ram[0xcc] | ((unsigned)g_ram[0xcd] << 8));
+  }
+  // TEMP DIAGNOSTIC: log the first frame each function is entered, to see the
+  // recomp's execution progression (AR_FUNCLOG=1). AR_FUNCLOG=<substr> filters.
+  if (getenv("AR_FUNCLOG")) {
+    static const void *seen[8192]; static int nseen;
+    int found = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == (const void*)name) { found = 1; break; }
+    if (!found && nseen < 8192) {
+      seen[nseen++] = name;
+      const char *filt = getenv("AR_FUNCLOG");
+      extern int snes_frame_counter;
+      if (filt[0] == '1' || strstr(name, filt))
+        fprintf(stderr, "[func] frame %d: %s\n", snes_frame_counter, name);
+    }
+  }
+  // TEMP DIAGNOSTIC: AR_CALLTRACE=N logs EVERY function entry during frames
+  // [N, N+2], with indentation by stack depth, for ground-truth control flow.
+  {
+    static int ct = -2;
+    if (ct == -2) { const char *e = getenv("AR_CALLTRACE"); ct = e ? atoi(e) : -1; }
+    if (ct >= 0) {
+      extern int snes_frame_counter;
+      extern CpuState g_cpu;
+      /* AR_CALLTRACE_GF=N: restrict the trace to game-frame $0088==N (cuts the
+       * action-frame noise to the one corrupting frame). S= shows the SNES stack
+       * pointer at entry, to spot a handler that leaks (next sibling S lower). */
+      static long ctgf = -2;
+      if (ctgf == -2) { const char *e = getenv("AR_CALLTRACE_GF"); ctgf = e ? atol(e) : -1; }
+      unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+      if (snes_frame_counter >= ct && snes_frame_counter <= ct + 4 &&
+          (ctgf < 0 || (long)gf == ctgf))
+        fprintf(stderr, "[ct S=%04x m=%u] %*s%s\n", g_cpu.S, (unsigned)g_cpu.m_flag,
+                g_recomp_stack_top * 2, "", name);
+    }
+  }
+  // TEMP DIAGNOSTIC: AR_CTACTION one-shot trace. ActRaiser_WaitForVblank arms
+  // g_trace_one_frame for exactly one inter-yield batch once the game enters
+  // action mode ($18==1), to capture the stuck per-frame loop without flooding.
+  if (getenv("AR_CTACTION") && !g_batch_done && name) {
+    extern int snes_frame_counter;
+    extern CpuState g_cpu;
+    if (strcmp(name, "bank_00_8465_M0X0") == 0) g_batch_had_8465 = 1;
+    if (g_batch_len < (int)sizeof(g_batch_buf) - 256)
+      g_batch_len += snprintf(g_batch_buf + g_batch_len,
+              sizeof(g_batch_buf) - (size_t)g_batch_len,
+              "[1f f%d m=%u x=%u] %*s%s\n", snes_frame_counter,
+              (unsigned)g_cpu.m_flag, (unsigned)g_cpu.x_flag,
+              g_recomp_stack_top * 2, "", name);
+  }
+  g_recomp_push_count++;   /* monotonic; AR_FRAMELOG measures per-frame work */
   if (g_recomp_stack_top < RECOMP_STACK_DEPTH)
     g_recomp_stack[g_recomp_stack_top++] = name;
   g_last_recomp_func = name;
@@ -185,6 +748,22 @@ void RecompStackDump(void) {
 }
 
 void RecompStackPop(void) {
+  /* AR_CALLTRACE exit log: pairs with the entry log; net (exitS-entryS) reveals
+   * the stack-leaking function (balanced JSR fn: +2, JSL fn: +3). */
+  {
+    static int ct = -2;
+    if (ct == -2) { const char *e = getenv("AR_CALLTRACE"); ct = e ? atoi(e) : -1; }
+    if (ct >= 0 && g_recomp_stack_top > 0) {
+      extern int snes_frame_counter; extern CpuState g_cpu; extern uint8 g_ram[];
+      static long ctgf = -2;
+      if (ctgf == -2) { const char *e = getenv("AR_CALLTRACE_GF"); ctgf = e ? atol(e) : -1; }
+      unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+      if (snes_frame_counter >= ct && snes_frame_counter <= ct + 4 &&
+          (ctgf < 0 || (long)gf == ctgf))
+        fprintf(stderr, "[ct S=%04x m=%u] %*s/%s\n", g_cpu.S, (unsigned)g_cpu.m_flag,
+                g_recomp_stack_top * 2, "", g_recomp_stack[g_recomp_stack_top - 1]);
+    }
+  }
   // Record exit BEFORE the pop so stack_depth reflects pre-pop state and
   // the function name is still the topmost entry. Defensive against
   // empty stack: the auditor must NOT consume an entry_seq it didn't push.
@@ -244,6 +823,12 @@ void WatchdogCheck(void) {
       fprintf(stderr, "  (empty — last was %s)\n", g_last_recomp_func);
     fprintf(stderr, "\n");
     fflush(stderr);
+    /* Capture the frozen state to saves/ for offline analysis. The watchdog
+     * fires inside the coroutine, so g_cpu/g_ram/g_recomp_stack hold the exact
+     * stuck state (the SDL event loop is wedged, so the F9/exit dumps can't
+     * run during a hang). Weak so non-app linkers don't require it. */
+    { extern void DumpDiagState(const char *) __attribute__((weak));
+      if (DumpDiagState) DumpDiagState("watchdog"); }
     g_watchdog_enabled = 0;
     g_watchdog_tripped = 1;
     { extern int snes_frame_counter;

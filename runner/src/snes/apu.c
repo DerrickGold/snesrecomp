@@ -100,7 +100,10 @@ void apu_saveload(Apu *apu, SaveLoadInfo *sli) {
 extern uint64_t g_spc_pc_histogram[0x10000];
 extern int g_spc_pc_max_seen;
 
+static uint64_t s_apu_cycle_count;
+uint64_t snes_apu_cycle_count(void) { return s_apu_cycle_count; }
 void apu_cycle(Apu* apu) {
+  s_apu_cycle_count++;
   if(apu->cpuCyclesLeft == 0) {
     /* Sample PC right BEFORE running the opcode — so PC reflects the
      * instruction we're about to execute, not the post-opcode PC. */

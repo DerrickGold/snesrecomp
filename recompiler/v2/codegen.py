@@ -244,6 +244,14 @@ def set_valid_variants(d) -> None:
     _VALID_VARIANTS = d or {}
 
 
+def have_valid_variants() -> bool:
+    """True once v2_regen's emit-truth prune pass has installed the
+    surviving-(m,x) map. The garbage-variant detector only runs when this is
+    set, so it never compares against an UNreachable (and thus possibly
+    garbage-decoded) sibling variant."""
+    return bool(_VALID_VARIANTS)
+
+
 def valid_variant_list(addr_24: int):
     """Return the (m, x) variants a dispatch switch should emit a case
     for at this call target, in canonical order. When v2_regen has
@@ -515,15 +523,30 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
     if k == SegKind.STACK:
         return ("0x00", f"(uint16)(cpu->S + {seg.offset:#06x})")
     if k == SegKind.DP_INDIRECT:
-        # ((D + dp) word) (+ Y if indirect-Y), DB-bank.
+        # ((D + dp) word), DB-bank. The (dp),Y form computes a 24-bit
+        # effective `DB:pointer + Y` where the carry from `pointer + Y`
+        # propagates INTO THE BANK — same hardware rule as ABS_X/ABS_Y
+        # (see the Zelda submodule-reset note above). Truncating to
+        # uint16 lost that carry. (verified vs Harte vectors.)
         ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x})"
-        return ("cpu->DB", f"(uint16)(cpu_read16(cpu, 0x00, {ptr_addr}){idx})")
+        ptr = f"cpu_read16_dp(cpu, {ptr_addr})"
+        if seg.index is None:
+            return ("cpu->DB", f"(uint16)({ptr})")
+        eff24 = (f"(((uint32)cpu->DB << 16) + (uint32)({ptr})"
+                 f" + (uint32){'cpu->X' if seg.index == Reg.X else 'cpu->Y'})")
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.DP_INDIRECT_LONG:
-        # ((D + dp) long) (+ Y).
+        # ((D + dp) long). The [dp],Y form adds Y to the full 24-bit
+        # pointer, with carry propagating across the bank boundary.
+        # (verified vs Harte vectors.)
         ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x})"
-        bank_expr = f"cpu_read8(cpu, 0x00, (uint16)({ptr_addr} + 2))"
-        addr_expr = f"(uint16)(cpu_read16(cpu, 0x00, {ptr_addr}){idx})"
-        return (bank_expr, addr_expr)
+        ptr_lo = f"cpu_read16_dp(cpu, {ptr_addr})"
+        ptr_bank = f"cpu_read8(cpu, 0x00, (uint16)({ptr_addr} + 2))"
+        if seg.index is None:
+            return (ptr_bank, f"(uint16)({ptr_lo})")
+        eff24 = (f"(((uint32)({ptr_bank}) << 16) + (uint32)({ptr_lo})"
+                 f" + (uint32){'cpu->X' if seg.index == Reg.X else 'cpu->Y'})")
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     if k == SegKind.ABS_INDIRECT:
         return ("cpu->PB",
                 f"cpu_read16(cpu, cpu->PB, (uint16){seg.offset:#06x})")
@@ -536,11 +559,14 @@ def _segref_addr_expr(seg: SegRef) -> tuple:
                 f"cpu_read16(cpu, 0x00, {addr})")
     if k == SegKind.DP_INDIRECT_X:
         ptr_addr = f"(uint16)(cpu->D + {seg.offset:#06x} + cpu->X)"
-        return ("cpu->DB", f"cpu_read16(cpu, 0x00, {ptr_addr})")
+        return ("cpu->DB", f"cpu_read16_dp(cpu, {ptr_addr})")
     if k == SegKind.STACK_REL_INDIRECT_Y:
+        # (sr,S),Y: 24-bit effective `DB:pointer + Y` with carry into the
+        # bank (same rule as (dp),Y). (verified vs Harte vectors.)
         ptr_addr = f"(uint16)(cpu->S + {seg.offset:#06x})"
-        return ("cpu->DB",
-                f"(uint16)(cpu_read16(cpu, 0x00, {ptr_addr}) + cpu->Y)")
+        ptr = f"cpu_read16_dp(cpu, {ptr_addr})"
+        eff24 = f"(((uint32)cpu->DB << 16) + (uint32)({ptr}) + (uint32)cpu->Y)"
+        return (f"(uint8)(({eff24}) >> 16)", f"(uint16)({eff24})")
     raise ValueError(f"unsupported SegKind {k}")
 
 
@@ -632,25 +658,78 @@ def _emit_alu(op: Alu) -> List[str]:
     lhs_m = widths.masked(_v(op.lhs), op.width)
     rhs_m = widths.masked(_v(op.rhs), op.width)
     if op.op == AluOp.ADD:
+        # ADC. The binary path is byte-identical to the original; the
+        # decimal-mode (D flag / SED) path does nibble-wise BCD addition.
+        # 65816 decimal ADC: result digits are BCD-adjusted and C is the
+        # DECIMAL carry. Real game uses this for score/timer (e.g. the
+        # action-stage timer counts $0300 -> $0299, not $02FF).
+        ct = widths.ctype(op.width)
+        nib = 2 * op.width
         lines.append(
             f"uint32 {tname} = (uint32){lhs_m} + (uint32){rhs_m} + cpu->_flag_C;"
         )
         if op.out is not None:
-            lines.append(f"{widths.ctype(op.width)} {_v(op.out)} = ({widths.ctype(op.width)}){tname};")
-        lines.append(widths.set_carry_from_overflow(tname, op.width, "add"))
-        # V flag for ADC: (lhs ^ result) & (rhs ^ result) & sign_bit
-        if op.out is not None:
-            lines.append(widths.set_v_adc(lhs_m, rhs_m, _v(op.out), op.width))
+            out = _v(op.out)
+            lines.append(f"{ct} {out};")
+            topsh = 8 * op.width - 4
+            sign = widths.sign_bit(op.width)
+            lines.append("if (cpu->_flag_D) {")
+            lines.append(f"  uint32 _da=(uint32){lhs_m}, _db=(uint32){rhs_m}, _dc=cpu->_flag_C, _dr=0, _vci=0;")
+            for k in range(nib):
+                sh = 4 * k
+                # capture the carry INTO the most-significant nibble — the V
+                # flag derives from that nibble's *signed* add, before its
+                # decimal correction (verified exact vs Harte 65816 vectors).
+                if k == nib - 1:
+                    lines.append("  _vci=_dc;")
+                lines.append(
+                    f"  {{ uint32 _n=((_da>>{sh})&0xF)+((_db>>{sh})&0xF)+_dc;"
+                    f" _dc=(_n>9)?1:0; if(_dc)_n+=6; _dr|=(_n&0xF)<<{sh}; }}")
+            lines.append(f"  {out}=({ct})_dr; cpu->_flag_C=_dc;")
+            # V flag (decimal ADC): signed overflow of the top-nibble add
+            # with carry-in from below, *before* decimal correction.
+            lines.append(f"  uint32 _vis=(_da & (0xFu<<{topsh})) + (_db & (0xFu<<{topsh})) + (_vci<<{topsh});")
+            lines.append(f"  cpu->_flag_V = (((_da ^ _vis) & (_db ^ _vis) & {sign}) != 0) ? 1 : 0;")
+            lines.append("} else {")
+            lines.append(f"  {out}=({ct}){tname};")
+            lines.append("  " + widths.set_carry_from_overflow(tname, op.width, "add"))
+            # V flag (binary ADC): (lhs ^ result) & (rhs ^ result) & sign_bit
+            lines.append("  " + widths.set_v_adc(lhs_m, rhs_m, out, op.width))
+            lines.append("}")
+        else:
+            lines.append(widths.set_carry_from_overflow(tname, op.width, "add"))
     elif op.op == AluOp.SUB:
+        # SBC. Binary path byte-identical to the original; decimal-mode path
+        # does nibble-wise BCD subtraction. Per 65816, SBC's carry/borrow is
+        # the BINARY result in both modes (only the digits are BCD-adjusted),
+        # so C and V are derived from the binary temp regardless of D.
+        ct = widths.ctype(op.width)
+        nib = 2 * op.width
         lines.append(
             f"uint32 {tname} = (uint32){lhs_m} - (uint32){rhs_m} - (1 - cpu->_flag_C);"
         )
         if op.out is not None:
-            lines.append(f"{widths.ctype(op.width)} {_v(op.out)} = ({widths.ctype(op.width)}){tname};")
-        lines.append(widths.set_carry_from_overflow(tname, op.width, "sub"))
-        # V flag for SBC: (lhs ^ rhs) & (lhs ^ result) & sign_bit
-        if op.out is not None:
-            lines.append(widths.set_v_sbc(lhs_m, rhs_m, _v(op.out), op.width))
+            out = _v(op.out)
+            lines.append(f"{ct} {out};")
+            lines.append("if (cpu->_flag_D) {")
+            lines.append(f"  uint32 _da=(uint32){lhs_m}, _db=(uint32){rhs_m}, _dr=0; int _bw=1-(int)cpu->_flag_C;")
+            for k in range(nib):
+                sh = 4 * k
+                lines.append(
+                    f"  {{ int _n=(int)((_da>>{sh})&0xF)-(int)((_db>>{sh})&0xF)-_bw;"
+                    f" if(_n<0){{_n+=10;_bw=1;}}else _bw=0; _dr|=((uint32)_n&0xF)<<{sh}; }}")
+            lines.append(f"  {out}=({ct})_dr;")
+            lines.append("} else {")
+            lines.append(f"  {out}=({ct}){tname};")
+            lines.append("}")
+            lines.append(widths.set_carry_from_overflow(tname, op.width, "sub"))
+            # V flag for SBC derives from the BINARY subtraction result in
+            # both modes (only the digits are BCD-adjusted, not the flags) —
+            # verified exact vs Harte 65816 vectors. Use the binary temp,
+            # not `out` (which is the decimal-corrected result).
+            lines.append(widths.set_v_sbc(lhs_m, rhs_m, f"(({ct}){tname})", op.width))
+        else:
+            lines.append(widths.set_carry_from_overflow(tname, op.width, "sub"))
     elif op.op == AluOp.AND:
         lines.append(
             f"{widths.ctype(op.width)} {_v(op.out)} = "
@@ -787,14 +866,18 @@ def _emit_bittest(op: BitTest) -> List[str]:
     ctype = widths.ctype(op.width)
     a_m = widths.masked("cpu->A", op.width)
     operand_m = widths.masked(_v(op.operand), op.width)
-    return [
+    lines = [
         "{",
         f"  {ctype} _bt = ({ctype})({a_m} & {operand_m});",
         f"  cpu->_flag_Z = (_bt == 0) ? 1 : 0;",
-        f"  cpu->_flag_N = (({operand_m} & {sign}) != 0) ? 1 : 0;",
-        f"  cpu->_flag_V = (({operand_m} & {overflow}) != 0) ? 1 : 0;",
-        "}",
     ]
+    # BIT #imm sets ONLY Z; the memory forms also copy operand bits
+    # 7/6 into N/V. (65816 semantics — verified vs Harte vectors.)
+    if not op.z_only:
+        lines.append(f"  cpu->_flag_N = (({operand_m} & {sign}) != 0) ? 1 : 0;")
+        lines.append(f"  cpu->_flag_V = (({operand_m} & {overflow}) != 0) ? 1 : 0;")
+    lines.append("}")
+    return lines
 
 
 def _emit_bitsetmem(op: BitSetMem) -> List[str]:
@@ -850,8 +933,16 @@ def _emit_repflags(op: RepFlags) -> List[str]:
 
 
 def _emit_sepflags(op: SepFlags) -> List[str]:
-    return ["{"] + [f"  {s}" for s in
-                    emitter_helpers.modify_p_via_mirrors(op.mask, "sep")] + ["}"]
+    body = [f"  {s}" for s in
+            emitter_helpers.modify_p_via_mirrors(op.mask, "sep")]
+    # Setting the X flag (-> 8-bit index) forces the high bytes of X and
+    # Y to zero — a hardware side effect of the width change. The mask is
+    # a compile-time constant so this is decided statically.
+    # (65816 semantics — verified vs Harte vectors.)
+    if op.mask & 0x10:
+        body.append("  cpu->X = (uint16)(cpu->X & 0xFF);")
+        body.append("  cpu->Y = (uint16)(cpu->Y & 0xFF);")
+    return ["{"] + body + ["}"]
 
 
 def _emit_xce(op: XCE) -> List[str]:
@@ -861,7 +952,12 @@ def _emit_xce(op: XCE) -> List[str]:
         "  uint8 _t = cpu->emulation;",
         "  cpu->emulation = cpu->_flag_C;",
         "  cpu->_flag_C = _t;",
-        "  if (cpu->emulation) { cpu->m_flag = 1; cpu->x_flag = 1; cpu_mirrors_to_p(cpu); }",
+        # Entering emulation forces 8-bit A/index (m=x=1), zeroes the X/Y
+        # high bytes, and confines the stack to page 1 (SH := 0x01).
+        # (65816 semantics — verified vs Harte vectors.)
+        "  if (cpu->emulation) { cpu->m_flag = 1; cpu->x_flag = 1;"
+        " cpu->X = (uint16)(cpu->X & 0xFF); cpu->Y = (uint16)(cpu->Y & 0xFF);"
+        " cpu->S = (uint16)(0x0100 | (cpu->S & 0xFF)); cpu_mirrors_to_p(cpu); }",
         "  cpu_trace_px_record(cpu, 0, 7 /*XCE*/, _old_p, cpu->P);",
         "}",
     ]
@@ -993,6 +1089,12 @@ def _emit_pullreg(op: PullReg) -> List[str]:
         return ["{ uint8 _old_p = cpu->P; uint16 _old_s = cpu->S;",
                 *(f"  {s}" for s in emitter_helpers.pop_byte_assign(field)),
                 "  cpu_p_to_mirrors(cpu);",
+                # If the pulled P sets the X flag (-> 8-bit index), the
+                # high bytes of X and Y become hardware-zero — same
+                # contract as SEP, but runtime-conditional on the pulled
+                # value. (verified vs Harte vectors.)
+                "  if (cpu->x_flag) { cpu->X = (uint16)(cpu->X & 0xFF);"
+                " cpu->Y = (uint16)(cpu->Y & 0xFF); }",
                 "  cpu_trace_stack_op(cpu, 0, CPU_STACK_OP_PLP, _old_s, +1);",
                 "  cpu_trace_event(cpu, 0, CPU_TR_PLP, _old_p, cpu->P);",
                 "  cpu_trace_px_record(cpu, 0, 2 /*PLP*/, _old_p, cpu->P); }"]
@@ -1114,7 +1216,13 @@ def _emit_transfer(op: Transfer) -> List[str]:
         ]
     # Determine destination width from controlling flag.
     if op.dst == Reg.A:
-        flag = "cpu->m_flag"
+        # TDC (D->A) and TSC (S->A) move the full 16-bit accumulator C
+        # regardless of the M flag — they are NOT M-width like TXA/TYA.
+        # (65816 semantics — verified vs Harte vectors.)
+        if op.src in (Reg.D, Reg.S):
+            flag = None
+        else:
+            flag = "cpu->m_flag"
     elif op.dst in (Reg.X, Reg.Y):
         flag = "cpu->x_flag"
     elif op.dst == Reg.D or op.dst == Reg.S:
@@ -1213,6 +1321,15 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # JSR → emit `break;`, fall through to next block.
     # JMP/JML → emit `return RECOMP_RETURN_NORMAL;` (terminal).
     is_jsr = getattr(insn, 'mnem', '') == 'JSR'
+    # PHA/RTS jump table that is a CALL (cfg `indirect_dispatch ... ret:<pc>`):
+    # a return address was pushed (PHY) before the handler addr, so each handler
+    # RTSs back to the in-function continuation `dispatch_ret`. Like a JSR for the
+    # per-case `break` + fall-through, but NO synthetic frame push (the PHY
+    # already pushed the return), and the switch ends with a `goto` the
+    # continuation label rather than falling through. (ActRaiser $01:B8AE.)
+    _ret16 = getattr(insn, 'dispatch_ret', None)
+    is_call_ret = _ret16 is not None
+    is_jsr_like = is_jsr or is_call_ret
 
     # Variant suffix for dispatched handlers follows the live width state
     # at the dispatch site. The PHA/SEP/RTS idiom is the exception: it
@@ -1241,7 +1358,12 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # inherits THIS function's entry-S baseline at the individual call site,
     # so split shared suffixes do not record a fresh stack baseline after the
     # tail transfer.
-    if is_jsr:
+    if is_call_ret:
+        # The PHY before the PHA already pushed the return frame (the handler
+        # RTSs back to it). Do NOT push another — just mark the paired call.
+        lines.append("  cpu->host_return_valid = 1;  /* PHA/RTS jump-table call "
+                     "(return frame pre-pushed by PHY) */")
+    elif is_jsr:
         _iret16 = (site_pc24 + 2) & 0xFFFF  # JSR (abs,X) is 3 bytes; push return-1
         lines.append(f"  cpu_write8(cpu, 0x00, cpu->S, 0x{(_iret16 >> 8) & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
         lines.append(f"  cpu_write8(cpu, 0x00, cpu->S, 0x{_iret16 & 0xFF:02x}); cpu->S = (uint16)(cpu->S - 1);")
@@ -1328,16 +1450,18 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                     "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
                 lines.append(
                     "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
-                lines.append("        return (RecompReturn)((int)_r - 1);")
+                lines.append("        return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));")
                 lines.append("      }")
-            if is_jsr:
+            if is_jsr_like:
                 lines.append("      break;")
             else:
                 lines.append("      return RECOMP_RETURN_NORMAL;")
             lines.append("    }")
         lines.append("    default: break;")
         lines.append("  }")
-        if is_jsr:
+        if is_call_ret:
+            lines.append(f"  goto L_{_ret16 & 0xFFFF:04X}{suffix};")
+        elif is_jsr:
             lines.append("  /* fall through to post-JSR block */")
         else:
             lines.append(
@@ -1362,12 +1486,11 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append("  }")
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append("  if (_idx >= _disp_n) {")
-    if is_jsr:
+    if is_jsr_like:
         # Non-terminal: dispatch_oob is a function that returns NORMAL,
         # but its return value is OUR caller's, not the dispatcher
-        # block's. For a JSR dispatcher we need to fall through to the
-        # post-JSR block — calling dispatch_oob and ignoring its return
-        # is the closest equivalent to "this case had no handler".
+        # block's. For a JSR/call dispatcher we fall through (out-of-range
+        # index -> switch default -> continue after the switch).
         lines.append(
             f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
     else:
@@ -1377,7 +1500,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     lines.append("  switch (_idx) {")
     for i, e in enumerate(entries):
         if e is None or e == 0:
-            if is_jsr:
+            if is_jsr_like:
                 lines.append(f"    case {i}: break; /* null entry */")
             else:
                 lines.append(
@@ -1426,7 +1549,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             lines.append(
                 "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
             _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
-                    if not is_jsr else None)
+                    if not is_jsr_like else None)
             lines += variant_dispatch_case_lines(
                 tgt_addr, base_name, indent="        ", pre_call=_pre)
             lines.append("      }")
@@ -1438,16 +1561,22 @@ def _emit_indirect_dispatch(insn) -> List[str]:
                 "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
             lines.append(
                 "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
-            lines.append("        return (RecompReturn)((int)_r - 1);")
+            lines.append("        return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));")
             lines.append("      }")
-        if is_jsr:
+        if is_jsr_like:
             lines.append("      break;")
         else:
             lines.append("      return RECOMP_RETURN_NORMAL;")
         lines.append("    }")
     lines.append("    default: break; /* unreachable: gated above */")
     lines.append("  }")
-    if is_jsr:
+    if is_call_ret:
+        # Handlers returned (their RTS popped the PHY'd return frame); continue
+        # at the in-function continuation. cpu->S is balanced (PHY/PHA pushed 4,
+        # the handler's RTS popped the 2-byte return, the PHA's 2 bytes were
+        # never materialised — the dispatch consumed them logically).
+        lines.append(f"  goto L_{_ret16 & 0xFFFF:04X}{suffix};")
+    elif is_jsr:
         # Switch ended; fall through into the next block emitted after
         # this dispatcher (the post-JSR block in the original asm).
         lines.append("  /* fall through to post-JSR block */")
@@ -1682,7 +1811,7 @@ def _emit_call(op: Call) -> List[str]:
                 "  if (_r != RECOMP_RETURN_NORMAL) {",
                 "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
                 "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-                "    return (RecompReturn)((int)_r - 1);",
+                "    return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
                 "  }",
                 "}",
             ]
@@ -1695,7 +1824,7 @@ def _emit_call(op: Call) -> List[str]:
             "  if (_r != RECOMP_RETURN_NORMAL) {",
             "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
             "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-            "    return (RecompReturn)((int)_r - 1);",
+            "    return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
             "  }",
             "}",
         ]
@@ -1720,7 +1849,7 @@ def _emit_call(op: Call) -> List[str]:
             "  if (_r != RECOMP_RETURN_NORMAL) {",
             "    cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);",
             "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-            "    return (RecompReturn)((int)_r - 1);",
+            "    return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
             "  }",
             "}",
         ])
@@ -1745,7 +1874,7 @@ def _emit_call(op: Call) -> List[str]:
         # this function's post-JSR cleanup (e.g. PLB) — by design
         # under the NLR ABI.
         "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
-        "    return (RecompReturn)((int)_r - 1);",
+        "    return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
         "  }",
         "}",
     ])
@@ -1854,20 +1983,45 @@ def _emit_return(op: Return) -> List[str]:
         "#endif",
         "  if (_hrv && _ret_s == _entry_s) {",
         f"    return RECOMP_RETURN_NORMAL;  /* {label_inner} host return */ }}",
-        # Return-to-ancestor (multi-level non-local return). When the stack
-        # was manually rebalanced shallower than this frame's entry
-        # (_ret_s != _entry_s, e.g. an OAM-overflow PLX/PLX/PLB epilogue)
-        # and the popped PC is a host-return continuation (dispatch miss),
-        # the RTS targets an ANCESTOR frame's continuation, not this
-        # caller's. Resolve the ancestor by entry_s == _ret_s and unwind
-        # to it via the existing SKIP_N decrement contract, so the ancestor
-        # host-returns NORMAL and its caller resumes correctly. (A one-level
-        # NORMAL miss-unwind here instead resumes intermediate frames that
-        # hardware skipped — the fish-explosion OAM wipe; see ISSUES.md.)
-        "  if (_ret_s != _entry_s && !cpu_dispatch_has_entry(cpu, _rpc24)) {",
-        "    int _anc_skip = cpu_resolve_ancestor_skip(_ret_s);",
-        "    if (_anc_skip >= 0) {",
-        "      cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
+        # Stack rebalanced shallower than this frame's entry (_ret_s !=
+        # _entry_s): the function manually popped past its own return frame and
+        # this RTS targets an ANCESTOR frame's continuation, not this caller's.
+        # We only treat it as a non-local return when some ancestor frame is
+        # actually parked at _ret_s (cpu_resolve_ancestor_skip >= 0); that match
+        # can only occur on a SHALLOW rebalance (_ret_s > _entry_s), so a genuine
+        # deeper computed RTS-dispatch (which leaves _ret_s <= _entry_s) never
+        # matches and falls through to the normal dispatch path below.
+        #
+        # Two sub-cases, by whether the popped PC (_rpc24) is real emitted code:
+        #
+        #  (a) _rpc24 is a dispatch MISS (not a registered entry) — e.g. an
+        #      OAM-overflow PLX/PLX/PLB epilogue returning to a mid-caller PC.
+        #      The ancestor frame is live and resumes that PC naturally, so we
+        #      unwind to it (SKIP_N). (A one-level NORMAL miss-unwind instead
+        #      resumes intermediate frames hardware skipped — the fish-explosion
+        #      OAM wipe; ISSUES.md.)
+        #
+        #  (b) _rpc24 IS a registered entry — e.g. the PLA/INC/STA $12,X
+        #      "continuation yield" idiom at $86FA, whose RTS targets $8966 (the
+        #      object-loop advance). That continuation must RUN (it drives the
+        #      rest of the loop), AND the yielding caller must NOT resume its own
+        #      tail (A758's C1B7/85B7 ran with X at the list terminator ->
+        #      clobbered the list terminator -> Act 1 freeze). Both at once = a
+        #      FLAT tail-dispatch to _rpc24: stash it and return TAILCALL so the
+        #      nearest driving loop runs it at the real cpu->S (already _ret_s +
+        #      frame_size after the pops above). Intervening paired (hrv==1)
+        #      frames propagate the TAILCALL (their call sites forward it without
+        #      running their tail), so the yielding caller is discarded rather
+        #      than re-run. This is the faithful model — no nested re-drive of
+        #      the loop (the old drive-then-skip double-ran it, compounding into
+        #      stack/state corruption a few frames later).
+        "  if (_ret_s != _entry_s && cpu_resolve_ancestor_skip(_ret_s) >= 0) {",
+        "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
+        "    if (cpu_dispatch_has_entry(cpu, _rpc24)) {",
+        f"      cpu_tailcall_request(_rpc24, (uint16)(_ret_s + {frame_sz}u), 0x{src24:06x}u);",
+        f"      return RECOMP_RETURN_TAILCALL;  /* {label_inner} yield: flat tail-dispatch to grandparent continuation */ }}",
+        "    {",
+        "      int _anc_skip = cpu_resolve_ancestor_skip(_ret_s);",
         f"      return (RecompReturn)_anc_skip;  /* {label_inner} return-to-ancestor */ }}",
         "  }",
         "  cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE);",
@@ -1878,7 +2032,34 @@ def _emit_return(op: Return) -> List[str]:
         # the caller's frame on every miss — an hrv=0 callee dispatches on every
         # RTS, so under heavy load (hundreds of misses/frame) cpu->S drifts down
         # into zero page and corrupts the DMA queue tail -> 82C8/BA48 spin.
-        f"  return cpu_dispatch_pc_from(cpu, _rpc24, (uint16)(_entry_s + {frame_sz}u), 0x{src24:06x}u);  /* {label_inner} dispatch */ }}",
+        #
+        # Trampoline: a DISPATCHED frame (_hrv==0) already runs inside a
+        # cpu_dispatch_pc_from driving loop. Recursively calling cpu_dispatch_
+        # pc_from here would nest the C/recomp stack once per computed jump — a
+        # RAM-pointer dispatch loop (ActRaiser $8915 object loop re-dispatching
+        # $8966 once per object) overflows RECOMP_STACK_DEPTH=64 and emits a
+        # giant SKIP_N that over-unwinds past its JSR caller (black playfield).
+        # Instead stash the target and return TAILCALL so the loop iterates flat.
+        # A PAIRED frame (_hrv==1) is the chain root and drives the loop itself.
+        # Miss-restore baseline = post-return-pop S. For a BALANCED function
+        # _ret_s == _entry_s so this is entry_s + frame_size (the original
+        # design). But when the function REBALANCED its stack SHALLOWER than
+        # entry via an unmatched PLP/PLA (_ret_s > _entry_s) — e.g. the
+        # ActRaiser object loop where the $8915 PHP is popped by the $896E PLP
+        # in the *separately-carved* $8966 continuation function — entry_s +
+        # frame_size under-restores by (_ret_s - _entry_s) and leaks that many
+        # bytes per call (1 byte/frame -> S marches into zero page -> DMA-queue
+        # descriptor $D0-$D5 corruption -> AF3D bad-DMA softlock). The correct
+        # post-pop S is _ret_s + frame_size (= current cpu->S after the pops
+        # above), which the ancestor branch already uses. A net-PUSH rebalance
+        # (_ret_s < _entry_s, e.g. a PEI trampoline) intentionally discards its
+        # pushed params via entry_s + frame_size, so keep that — only the
+        # shallow (net-pop) case switches. Hence max(_ret_s, _entry_s).
+        f"  uint16 _miss_s = (uint16)(((_ret_s > _entry_s) ? _ret_s : _entry_s) + {frame_sz}u);",
+        "  if (!_hrv) {",
+        f"    cpu_tailcall_request(_rpc24, _miss_s, 0x{src24:06x}u);",
+        f"    return RECOMP_RETURN_TAILCALL;  /* {label_inner} tail-dispatch (trampolined) */ }}",
+        f"  return cpu_dispatch_pc_from(cpu, _rpc24, _miss_s, 0x{src24:06x}u);  /* {label_inner} dispatch (drive) */ }}",
     ])
     return lines
 
@@ -1890,7 +2071,14 @@ def _emit_stop(op: Stop) -> List[str]:
 
 
 def _emit_break(op: Break) -> List[str]:
-    return ["/* COP: software interrupt */" if op.cop else "/* BRK: software interrupt */"]
+    if op.cop:
+        # COP software interrupt (vector $FFE4). Modeled via the same hook;
+        # games that don't use COP leave the hook NULL (no-op).
+        return ["if (g_cpu_cop_hook) g_cpu_cop_hook(cpu);  /* COP: software interrupt -> vector, RTI to PC+2 */"]
+    # BRK software interrupt (vector $FFE6). The handler does its work and RTIs
+    # to PC+2; we model that effect via a game-supplied hook and FALL THROUGH to
+    # the next instruction (BRK is no longer a terminator — see decoder.py).
+    return ["if (g_cpu_brk_hook) g_cpu_brk_hook(cpu);  /* BRK: software interrupt -> vector, RTI to PC+2 */"]
 
 
 def _emit_nop(op: Nop) -> List[str]:

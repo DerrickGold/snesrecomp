@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <execinfo.h>
 
 #include "snes.h"
 #include "../debug_server.h"
@@ -1043,7 +1044,26 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
       return val;
     }
     default: {
-      assert(0);
+      /* Invalid/write-only PPU register read (e.g. $2100-$2133).
+       * Almost always a side effect of a misconfigured DMA/garbage
+       * read on the boot path. Return open-bus 0 instead of crashing
+       * so the game keeps progressing; log once per register. */
+      {
+        extern const char *g_last_recomp_func;
+        static uint64_t seen_mask;
+        static int bt_dumped;
+        if (adr < 64 && !(seen_mask & (1ull << adr))) {
+          seen_mask |= (1ull << adr);
+          fprintf(stderr, "[ppu_read] invalid read of $21%02X (open-bus 0) "
+                  "from %s\n", adr, g_last_recomp_func ? g_last_recomp_func : "?");
+          if (!bt_dumped) {
+            bt_dumped = 1;
+            void *bt[24];
+            int n = backtrace(bt, 24);
+            backtrace_symbols_fd(bt, n, 2);
+          }
+        }
+      }
       return 0;
     }
   }
@@ -1054,6 +1074,13 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
 //    printf("ppu_write(%d, %d)\n", adr, val);
   switch(adr) {
     case INIDISP & 0xff:
+      if (getenv("AR_INIDISP2") && val != ppu->inidisp) {
+        extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+        extern const char *g_last_recomp_func;
+        fprintf(stderr, "[inidisp2] f=%d $2100 %02x->%02x (bright=%d fblank=%d) $18=%02x by=%s\n",
+          snes_frame_counter, ppu->inidisp, val, val & 0xf, (val & 0x80) ? 1 : 0, g_ram[0x18],
+          g_last_recomp_func ? g_last_recomp_func : "?");
+      }
       ppu->inidisp = val;
       break;
     case OBSEL & 0xff:

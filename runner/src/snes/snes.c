@@ -145,9 +145,110 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     RtlApuLock();
     rtl_accumulate_apu_catchup();
     snes_catchupApu(snes);
+    /* AR_SPC_SPINFIX=1 (opt-in): resident-uploader deadlock breaker — the
+     * boss-music-load fix. ActRaiser's sound engine has its own IPL-style
+     * uploader resident in ARAM at $0F0E: it raises the $AABB "ready"
+     * signature and spins at $0F12 (`MOV A,$F4; CMP #$CC; BNE`) waiting for
+     * the CPU to send $CC and stream a block image. On hardware the CPU's
+     * $02:9A56 drives that. We HLE $9A56 (it memcpys the image straight into
+     * apu->ram — running it natively over-clocks the SPC and breaks boot), so
+     * the $CC stream is NEVER sent and the engine sits in its uploader forever.
+     * A later boss command ($00:A410 sends $F1 and spins for the echo) then
+     * deadlocks: the SPC is stuck in the uploader (out=$AABB) and can't answer
+     * -> 5 s watchdog -> SIGSEGV. Since the data is already in apu->ram, just
+     * finalize the engine's uploader for it: when we catch it parked in the
+     * $0F12 $CC-wait with the $AABB signature on a poll, jump the SPC to the
+     * uploader's tail at $0F48 (`MOV X,#$31; MOV $F1,X; RET` — clears the
+     * ports + enables timer0, then returns to the engine main loop), exactly
+     * as a completed transfer would. The engine then processes the pending
+     * command normally. Threshold keeps it from firing on a momentary pass
+     * through the wait. */
+    {
+      /* Read-path backstop for the resident-uploader deadlock. The PRIMARY fix
+       * is in the HLE upload path (common_rtl.c: completes the engine's
+       * resident uploader to $0F48 at upload time), which prevents the stuck
+       * state entirely — so this never fires in practice. Kept opt-in
+       * (AR_SPC_SPINFIX=1) as a safety net for any path that enters the
+       * uploader without a following HLE upload. Forces $0F4C (bare RET, no
+       * port-clear) since it fires LATE, with a play command already pending. */
+      static int s_spinfix = -1;
+      if (s_spinfix < 0) s_spinfix = getenv("AR_SPC_SPINFIX") ? 1 : 0;  /* default OFF; HLE path is primary */
+      if (s_spinfix) {
+        Spc *s = snes->apu->spc;
+        static uint32_t stuck;
+        /* Detect by PC alone: the $0F12..$0F18 loop is the resident uploader's
+         * $CC-wait, and since $9A56 is HLE'd the $CC stream is never sent, so any
+         * sustained time here is the deadlock (a real transfer would stream and
+         * leave immediately). Jump to $0F4C — the bare RET, SKIPPING the
+         * $0F48 `MOV $F1,#$31` which would clear the input ports and wipe the
+         * pending command ($F1) the CPU is waiting to have echoed. The engine
+         * then returns to its main loop, sees $F1 in inPort0, and echoes it. */
+        if (s->pc >= 0x0F12 && s->pc <= 0x0F18) {
+          if (++stuck > 2000u) {
+            s->pc = 0x0F4C;   /* bare RET, preserve pending input ports */
+            stuck = 0;
+            if (getenv("AR_APULOG")) {
+              extern int snes_frame_counter;
+              fprintf(stderr, "[apu] f=%d SPINFIX: forced SPC out of resident uploader -> $0F4C RET (in=%02x%02x out=%02x%02x sp=%02x)\n",
+                      snes_frame_counter, snes->apu->inPorts[0], snes->apu->inPorts[1],
+                      snes->apu->outPorts[0], snes->apu->outPorts[1], s->sp);
+            }
+          }
+        } else {
+          stuck = 0;
+        }
+      }
+    }
     uint8_t v = snes->apu->outPorts[adr & 0x3];
     audio_trace_on_cpu_port_read((uint8_t)(adr & 0x3), v);
     RtlApuUnlock();
+    if (getenv("AR_APULOG") && (adr & 0xfc) == 0x40) {  /* $2140-$2143 */
+      extern int snes_frame_counter;
+      static uint8_t lastv[4] = {0xff,0xff,0xff,0xff};
+      if (v != lastv[adr & 3]) {  /* only on change to cut spin spam */
+        lastv[adr & 3] = v;
+        fprintf(stderr, "[apu] f=%d READ  $21%02x -> %02x\n", snes_frame_counter, (unsigned)(adr & 0xff), v);
+      }
+      /* During a spin (same value read repeatedly) periodically dump SPC
+       * engine state so we can see if the SPC is alive/advancing. */
+      if ((adr & 3) == 0) {
+        static uint64_t rd_count;
+        if ((rd_count++ % 200000) == 0) {
+          uint16_t pc = snes->apu->spc->pc;
+          uint8_t *r = snes->apu->ram;
+          extern uint64_t snes_apu_cycle_count(void);
+          fprintf(stderr, "[apu] f=%d SPIN $2140=%02x spc.pc=%04x sp=%02x a=%02x cyc=%d apucyc=%llu code@pc=%02x %02x %02x %02x in=%02x%02x%02x%02x out=%02x%02x%02x%02x romRd=%d\n",
+                  snes_frame_counter, v, pc, snes->apu->spc->sp, snes->apu->spc->a,
+                  (int)snes->apuCatchupCycles, (unsigned long long)snes_apu_cycle_count(),
+                  r[pc], r[(uint16_t)(pc+1)], r[(uint16_t)(pc+2)], r[(uint16_t)(pc+3)],
+                  snes->apu->inPorts[0], snes->apu->inPorts[1], snes->apu->inPorts[2], snes->apu->inPorts[3],
+                  snes->apu->outPorts[0], snes->apu->outPorts[1], snes->apu->outPorts[2], snes->apu->outPorts[3],
+                  (int)snes->apu->romReadable);
+        }
+      }
+      /* AR_SPCDUMP: one-shot dump of the SPC ARAM + regs the first time we
+       * see the resident-uploader deadlock (SPC parked at $0Fxx with the
+       * $AABB ready signature on the out ports while the CPU spins on a
+       * port). Lets us decode the engine's command dispatch + resident
+       * uploader offline to build the HLE completion. */
+      if (getenv("AR_SPCDUMP")) {
+        uint16_t pc = snes->apu->spc->pc;
+        if (pc >= 0x0F12 && pc <= 0x0F18) {
+          static int done;
+          if (!done) {
+            done = 1;
+            FILE *f = fopen("/tmp/aram.bin", "wb");
+            if (f) { fwrite(snes->apu->ram, 1, 0x10000, f); fclose(f); }
+            Spc *s = snes->apu->spc;
+            fprintf(stderr, "[spcdump] aram->/tmp/aram.bin  pc=%04x sp=%02x a=%02x x=%02x y=%02x p=%d in=%02x%02x%02x%02x out=%02x%02x%02x%02x\n",
+                    s->pc, s->sp, s->a, s->x, s->y, (int)s->p,
+                    snes->apu->inPorts[0], snes->apu->inPorts[1], snes->apu->inPorts[2], snes->apu->inPorts[3],
+                    snes->apu->outPorts[0], snes->apu->outPorts[1], snes->apu->outPorts[2], snes->apu->outPorts[3]);
+            fflush(stderr);
+          }
+        }
+      }
+    }
     return v;
   }
   if(adr == 0x80) {
@@ -167,10 +268,24 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
 
 void snes_writeBBus(Snes* snes, uint8_t adr, uint8_t val) {
   if(adr < 0x40) {
+    if (adr == 0x00 && getenv("AR_INIDISP")) {  /* $2100 INIDISP */
+      extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+      extern const char *g_last_recomp_func;
+      static uint8_t lastv = 0xfe;
+      if (val != lastv) { lastv = val;
+        fprintf(stderr, "[inidisp] f=%d $2100<-%02x (bright=%d fblank=%d) $18=%02x by=%s\n",
+          snes_frame_counter, val, val & 0xf, (val & 0x80) ? 1 : 0, g_ram[0x18],
+          g_last_recomp_func ? g_last_recomp_func : "?");
+      }
+    }
     ppu_write(g_ppu, adr, val);
     return;
   }
   if(adr < 0x80) {
+    if (getenv("AR_APULOG") && (adr & 0xfc) == 0x40) {  /* $2140-$2143 */
+      extern int snes_frame_counter;
+      fprintf(stderr, "[apu] f=%d WRITE $21%02x <- %02x\n", snes_frame_counter, adr, val);
+    }
     RtlApuWrite(0x2100 + adr, val);
     return;
   }
@@ -214,14 +329,85 @@ uint16_t SwapInputBits(uint16_t x) {
 uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   switch(adr) {
     case 0x4210: {
+      /* RDNMI. forceNmi is held true for the whole coroutine run so vblank
+       * bits read "set" during the frame; that makes an inline `LDA $4210 /
+       * BPL` vblank-wait (e.g. bank_01's intro loop at $01:9293, not HLE'd
+       * like A85E) exit instantly without yielding, so its loop busy-spins a
+       * whole host frame -> watchdog. Pace it: when polled from the main
+       * coroutine, yield a frame (draw + run NMI) so the wait advances one
+       * real frame per poll, exactly as the HLE'd A85E does. Guard against
+       * re-entry from the NMI/IRQ handlers (which run with forceNmi cleared)
+       * and from a yield already in progress. */
+      extern void ActRaiser_YieldToHost(void);
+      extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+      static bool yielding;
+      if (snes->forceNmi && !yielding && !getenv("AR_NO4210YIELD")) {
+        /* Frame pacing for inline (non-HLE'd) vblank waits. The canonical SNES
+         * wait is three reads in three distinct basic blocks:
+         *     LDA $4210            ; clear  (block A)   -- value discarded
+         *   @sp: LDA $4210; BPL @sp ; spin   (block B)   -- self-looping block
+         *     LDA $4210            ; post   (block C)   -- value discarded
+         * The recomp collapses the spin's hardware busy-loop into a single host
+         * frame. The old "yield whenever the once-per-frame token is consumed"
+         * model yielded on the clear, the spin, AND the post read -> 3 host
+         * frames per logical wait -> the angel sim menu and Mode-7 spiral ran at
+         * ~1/3 speed.
+         *
+         * Distinguish the spin from the isolated clear/post reads by the SNES
+         * block PC, which cpu_trace_block records (unconditionally) into
+         * g_ar_blk_ring before each block runs. A $4210 read whose block PC
+         * REPEATS the previous forced-NMI $4210 read's block is a spin loop
+         * iteration -> yield exactly one frame and return bit7=1 so BPL falls
+         * through. The clear and post reads live in their own one-shot blocks
+         * (no repeat) -> return bit7=0 (not in vblank at this isolated read) and
+         * do NOT yield. Net: one host frame per wait, matching HLE'd $8418/$A85E.
+         * (HLE'd waits don't execute this code at all.) */
+        /* Only pair reads WITHIN the same host frame. A real spin reads $4210
+         * twice with no frame boundary between (the host frame advances only AT
+         * the yielding read). A per-frame NMI-ack like $00:8465 reads $4210 once
+         * per frame; across frames its block PC is identical, which would
+         * false-match as a "spin" and inject spurious yields (observed: action
+         * mode yielding at blk=008465, ~3 host frames per game frame = slow).
+         * Reset the tracker whenever the host frame changes so a read can only
+         * pair with another read from the SAME frame -> $8465's once-per-frame
+         * reads never pair, while the spin's two same-frame reads still do. */
+        extern int snes_frame_counter;
+        static int s_last4210Frame = -1;
+        if (snes_frame_counter != s_last4210Frame) {
+          s_last4210Frame = snes_frame_counter;
+          snes->last4210Block = 0;
+        }
+        uint32_t blk = g_ar_blk_ring[(g_ar_blk_idx - 1) & 1023u];
+        if (blk != 0 && blk == snes->last4210Block) {
+          /* spin iteration: same block read $4210 twice in a row -> the busy
+           * wait. Pace one frame, then break the loop. */
+          if (getenv("AR_VBLOG")) {
+            extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+            extern Ppu *g_ppu;
+            static int lf = -1;
+            if (snes_frame_counter != lf) {
+              lf = snes_frame_counter;
+              extern uint16 ar_cpu_S(void); extern uint8 ar_cpu_PB(void);
+              uint16 s = ar_cpu_S();
+              fprintf(stderr, "[vbl] f=%d bright=%d fblank=%d bgmode=%02x main=%02x $18=%02x $19=%02x time$E6=%02x%02x HP=%02x PB=%02x S=%04x blk=%06X\n",
+                      snes_frame_counter, g_ppu->inidisp & 0xf,
+                      (g_ppu->inidisp & 0x80) ? 1 : 0, g_ppu->bgmode,
+                      g_ppu->screenEnabled[0], g_ram[0x18], g_ram[0x19],
+                      g_ram[0xE7], g_ram[0xE6], g_ram[0x1D], ar_cpu_PB(), s, blk);
+            }
+          }
+          yielding = true;
+          ActRaiser_YieldToHost();
+          yielding = false;
+          snes->last4210Block = 0;  /* episode done; don't fold the post read in */
+          return 0x82;              /* CPU version 2 + bit7=1 (NMI/vblank seen) */
+        }
+        snes->last4210Block = blk;
+        return 0x02;                /* CPU version 2, bit7=0: not in vblank now */
+      }
       uint8_t val = 0x2; // CPU version (4 bit)
-      val |= snes->inNmi << 7;
-      // Real hardware clears the NMI-pending latch on read. Without this
-      // a stale `inNmi=true` would persist across NMI handler exit and
-      // produce a spurious second-read=true if anything re-reads $4210
-      // before the next NMI fires. (SMW happens to discard the loaded
-      // value, but a hardware-correct read-clear costs one store and
-      // is the right contract for game #2.)
+      bool nmi = snes->inNmi || snes->forceNmi;
+      val |= nmi << 7;
       snes->inNmi = false;
       return val;
     }
@@ -275,10 +461,13 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
        * For correctness without full strobe-latch tracking, return
        * 0x01 unconditionally — same effect as snes9x's post-latch
        * read past 16 bits with a standard pad attached. */
+      if (getenv("AR_JOYLOG") && snes->input1_currentState) { static int n; if(n++<8) fprintf(stderr,"[joy] read $%04X (manual) in1=%04X\n", adr, snes->input1_currentState); }
       return 0x01;
     case 0x4218:
+      if (getenv("AR_JOYLOG") && snes->input1_currentState) { static int n; if(n++<8) fprintf(stderr,"[joy] read $4218 -> %02X (in1=%04X)\n", SwapInputBits(snes->input1_currentState)&0xff, snes->input1_currentState); }
       return SwapInputBits(snes->input1_currentState) & 0xff;
     case 0x4219:
+      if (getenv("AR_JOYLOG") && snes->input1_currentState) { static int n; if(n++<8) fprintf(stderr,"[joy] read $4219 -> %02X (in1=%04X)\n", SwapInputBits(snes->input1_currentState)>>8, snes->input1_currentState); }
       return SwapInputBits(snes->input1_currentState) >> 8;
     case 0x421a:
       return SwapInputBits(snes->input2_currentState) & 0xff;

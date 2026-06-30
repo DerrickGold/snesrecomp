@@ -42,6 +42,10 @@ struct Snes {
   uint16_t hTimer;
   uint16_t vTimer;
   bool inNmi;
+  bool forceNmi;
+  bool nmiAvail;   /* once-per-frame RDNMI ($4210 bit7) token for paced waits */
+  uint32_t last4210Block; /* SNES block PC of the previous forced-NMI $4210 read;
+                           * a repeat means a vblank-wait spin (see snes_readReg) */
   bool inIrq;
   bool inVblank;
   // joypad
