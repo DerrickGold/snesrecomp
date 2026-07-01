@@ -595,6 +595,18 @@ def emit_function(rom: bytes, bank: int, start: int,
     # emit_bank produces.
     func_name = f"{func_name}{_variant_suffix(entry_m, entry_x)}"
 
+    # Exit-invariant check context (AR_EXITMX / AR_EXITS): tell codegen this
+    # function's name + the exit (m,x) recorded for its callers, so _emit_return
+    # can validate it at every RTS/RTL. The recorded exit-mx is the callee_exit_mx
+    # value THIS variant advertised — a runtime mismatch is the caller-poisoning
+    # exit-mx misdecode class ($03:9156). None when the analyzer left it
+    # ambiguous (callers "preserve") -> exit-mx check skipped for this variant.
+    _fn_pc24 = (bank << 16) | (start & 0xFFFF)
+    _rec_exit_mx = (callee_exit_mx or {}).get(
+        (_fn_pc24, entry_m & 1, entry_x & 1))
+    from v2.codegen import set_current_exit_ctx
+    set_current_exit_ctx(func_name, _rec_exit_mx)
+
     # Mint a per-function value-id counter shared across all blocks.
     counter = [0]
     def vf():
@@ -1572,7 +1584,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                         # (the $03:9156 act->sim M0X0 leak class). Log it (env-
                         # gated, default silent) so a missing target is named at
                         # runtime: add it to the `rts_dispatch` directive.
-                        _site24 = (_SAME_BANK << 16) | (di_insn.pc & 0xFFFF)
+                        _site24 = di_insn.addr & 0xFFFFFF
                         lines.append(
                             "    default:")
                         lines.append(

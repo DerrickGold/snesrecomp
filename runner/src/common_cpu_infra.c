@@ -257,6 +257,52 @@ void ar_entry_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32_t pc
   fflush(stderr);
 }
 
+/* Exit-mx invariant check (AR_EXITMX) — symmetric twin of ar_entry_mx_check.
+ * See cpu_state.h. Fires when a function's actual runtime exit (m,x) differs
+ * from the exit (m,x) the emitter told its callers; that mismatch is exactly
+ * what poisons every caller's post-call decode (the $03:9156 act->sim class). */
+int g_ar_exit_mx_check = 0;
+void ar_exit_mx_fail(CpuState *cpu, int exm, int exx, const char *fn, uint32_t pc24) {
+  static const char *seen[256];
+  static unsigned nseen = 0, total = 0;
+  const char *f = fn ? fn : g_last_recomp_func;
+  for (unsigned i = 0; i < nseen; i++)
+    if (seen[i] == f) return;             /* one report per function */
+  if (nseen < 256) seen[nseen++] = f;
+  if (total++ >= 2000) return;
+  extern int snes_frame_counter;
+  fprintf(stderr,
+    "[exit-mx] %s (%06X) EXITS m=%u x=%u but callers were told m=%d x=%d"
+    "  f=%d -> caller post-call decode poisoned\n",
+    f ? f : "?", pc24, cpu->m_flag & 1, cpu->x_flag & 1, exm, exx,
+    snes_frame_counter);
+  fflush(stderr);
+}
+
+/* Exit stack-balance check (AR_EXITS) — see cpu_state.h. A paired frame whose
+ * RTS/RTL is reached with cpu->S drifted from _entry_s (and no ancestor parked
+ * there) pops a garbage return (the $01:B8CF PLB;PLP;RTL-on-drifted-stack
+ * class). Names the drifting function at its own return, before the garbage
+ * dispatch cascades. */
+int g_ar_exit_s_check = 0;
+void ar_exit_s_fail(CpuState *cpu, uint32_t entry_s, uint32_t ret_s,
+                    const char *fn, uint32_t pc24) {
+  static const char *seen[256];
+  static unsigned nseen = 0, total = 0;
+  const char *f = fn ? fn : g_last_recomp_func;
+  for (unsigned i = 0; i < nseen; i++)
+    if (seen[i] == f) return;
+  if (nseen < 256) seen[nseen++] = f;
+  if (total++ >= 2000) return;
+  extern int snes_frame_counter;
+  fprintf(stderr,
+    "[exit-s] %s (%06X) RTS/RTL stack DRIFT: entry_s=$%04X ret_s=$%04X"
+    " (delta %+d) f=%d -> pops a garbage return\n",
+    f ? f : "?", pc24, entry_s & 0xFFFF, ret_s & 0xFFFF,
+    (int)((int32_t)ret_s - (int32_t)entry_s), snes_frame_counter);
+  fflush(stderr);
+}
+
 /* Always-on lightweight block-PC ring (works in non-trace builds, where
  * cpu_trace.c's ring is absent). Written by the inline cpu_trace_block;
  * read by the watchdog dump to reveal an infinite-loop's block cycle. */

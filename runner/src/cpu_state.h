@@ -447,6 +447,37 @@ static inline void ar_entry_mx_check(CpuState *cpu, int em, int ex,
     ar_entry_trapfn(cpu, fn, pc24);
 }
 
+/* ── Exit-side invariant checks (symmetric twins of ar_entry_mx_check) ──
+ * Every function validates its ENTRY (m,x) but historically returned
+ * completely unchecked — the blind spot where both the $03:9156 (exit-m
+ * misdecode) and $01:B8CF (exit stack-drift) act->sim crashes lived.
+ *
+ * ar_exit_mx_check: at a clean host-return, runtime (m,x) MUST equal the
+ *   exit (m,x) the emitter recorded for this variant (the value propagated
+ *   to CALLERS). A mismatch = the exit-mx analysis was wrong -> every caller
+ *   decoded its post-call code at the wrong width. Names the culprit at its
+ *   source in one run (would have flagged $9156's bogus (1,0) exit).
+ * ar_exit_s_check: at an RTS/RTL reached with cpu->S != entry_s on a paired
+ *   (host-JSR) frame with no ancestor parked there, the function DRIFTED its
+ *   stack -> the RTS/RTL pops a garbage return ($01:B8CF PLB;PLP;RTL class).
+ * Both rate-limited, log-and-continue, env-gated (AR_EXITMX / AR_EXITS). */
+extern int g_ar_exit_mx_check;  /* set once from AR_EXITMX env */
+extern int g_ar_exit_s_check;   /* set once from AR_EXITS env */
+void ar_exit_mx_fail(CpuState *cpu, int exm, int exx, const char *fn, uint32 pc24);
+void ar_exit_s_fail(CpuState *cpu, uint32 entry_s, uint32 ret_s,
+                    const char *fn, uint32 pc24);
+static inline void ar_exit_mx_check(CpuState *cpu, int exm, int exx,
+                                    const char *fn, uint32 pc24) {
+  if (g_ar_exit_mx_check
+      && (((cpu->m_flag & 1) != exm) || ((cpu->x_flag & 1) != exx)))
+    ar_exit_mx_fail(cpu, exm, exx, fn, pc24);
+}
+static inline void ar_exit_s_check(CpuState *cpu, uint16 entry_s, uint16 ret_s,
+                                   const char *fn, uint32 pc24) {
+  if (g_ar_exit_s_check && ret_s != entry_s)
+    ar_exit_s_fail(cpu, entry_s, ret_s, fn, pc24);
+}
+
 /* ── PEI-trampoline dispatch (2026-05-24, narrow detector) ─────────────
  *
  * Codegen emits a trampoline-aware RTS/RTL ONLY for functions flagged

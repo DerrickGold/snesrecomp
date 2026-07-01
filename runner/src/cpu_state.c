@@ -474,6 +474,35 @@ const DispatchLogEntry *cpu_dispatch_log_at(unsigned i) {
     return &g_dispatch_log[i % DISPATCH_LOG_CAP];
 }
 
+/* On-exit post-mortem dump of the dispatch ring to a standalone JSON file.
+ * The TCP `dispatch_log_get` command needs the debug server connected; this
+ * is the offline equivalent — the readable record of the last DISPATCH_LOG_CAP
+ * runtime dispatches feeding into a crash. Each `found:0` entry is a target
+ * that missed the AOT table (resolve lead). Adapted from upstream snesrecomp's
+ * CpuDispatchLogDumpJson; emits hex pc24/source for grep-ability. */
+void CpuDispatchLogWriteFile(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    unsigned total = g_dispatch_log_idx;
+    unsigned n = total < DISPATCH_LOG_CAP ? total : DISPATCH_LOG_CAP;
+    unsigned start = total - n;
+    fprintf(f, "{\n  \"dispatch_log\": {\"total\": %u, \"shown\": %u, "
+               "\"events\": [\n", total, n);
+    for (unsigned i = 0; i < n; i++) {
+        const DispatchLogEntry *e = &g_dispatch_log[(start + i) % DISPATCH_LOG_CAP];
+        const char *nm = e->func_name ? e->func_name : "(none)";
+        fprintf(f,
+            "%s    {\"i\":%u,\"pc24\":\"%06X\",\"source_pc24\":\"%06X\","
+            "\"func\":\"%s\",\"mx\":%u,\"found\":%u,\"mirror\":%u,\"frame\":%u}",
+            (i ? ",\n" : ""), start + i,
+            (unsigned)e->pc24, (unsigned)e->source_pc24, nm,
+            (unsigned)e->mx_idx, (unsigned)e->found,
+            (unsigned)e->mirror, (unsigned)e->frame);
+    }
+    fprintf(f, "\n  ]}\n}\n");
+    fclose(f);
+}
+
 static RecompReturn (*_cpu_dispatch_lookup(CpuState *cpu, uint32 pc24))(CpuState *) {
     unsigned lo = 0;
     unsigned hi = g_dispatch_table_count;

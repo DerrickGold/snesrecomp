@@ -76,7 +76,9 @@ for p in (str(_THIS_DIR), str(_RECOMPILER_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from v2.decoder import decode_function, analyze_function_exit_mx  # noqa: E402
+from v2.decoder import (  # noqa: E402
+    decode_function, analyze_function_exit_mx, set_decode_cache_enabled,
+)
 
 
 @dataclass(frozen=True)
@@ -98,10 +100,43 @@ class FixRecord:
 _MX_COMBOS: List[Tuple[int, int]] = [(0, 0), (0, 1), (1, 0), (1, 1)]
 
 
+def build_indirect_dispatch_map(parsed) -> dict:
+    """Merge every cfg's `indirect_dispatch` + `rts_dispatch` directives into
+    one pc24-keyed map, in the exact shape `decoder.decode_function` expects
+    (mirrors v2_regen.py's per-bank `ind_dispatch_map` construction, but
+    global across all banks since site_pc24 already encodes the bank).
+
+    2026-06-30: without this, `detect_and_route`'s decode of any function
+    containing an `rts_dispatch` (RTS-trick) site never learns the trick's
+    continuation targets, so the trick's own SEP/RTS gets treated as a
+    literal function exit instead of an in-function jump — folding its
+    mid-chain (m, x) into the exit meet. For ActRaiser $03:9156 this silently
+    produced a WRONG exit-mx of (1, 0) instead of the true (0, 0) (the
+    $9195 REP->m=0 terminal, never reached by the unauthorised decode),
+    which then poisoned caller $03:8053's post-JSR decode -> the act->sim
+    crash (see [[actsim-crash-nlr-fix]]). Passing this map fixes the
+    auto-router itself for EVERY rts_dispatch/indirect_dispatch site, not
+    just this one — root-cause, not a one-off hint.
+    """
+    ind_map: dict = {}
+    for bank, _cfg_path, cfg in parsed:
+        for d in (getattr(cfg, 'indirect_dispatch', None) or []):
+            pc24 = (bank << 16) | (d['site_pc16'] & 0xFFFF)
+            ind_map[pc24] = d
+        for d in (getattr(cfg, 'rts_dispatch', None) or []):
+            pc24 = (bank << 16) | (d['site_pc16'] & 0xFFFF)
+            ind_map[pc24] = {
+                'rts_trick': True,
+                'targets': tuple(d['targets']),
+            }
+    return ind_map
+
+
 def _decode_variant_exit(rom: bytes, bank: int, addr16: int,
                          em: int, ex: int, end,
                          callee_exit_mx,
-                         dispatch_helpers=None):
+                         dispatch_helpers=None,
+                         indirect_dispatch=None):
     """Decode (bank, addr16) with entry (em, ex) and the provided
     callee_exit_mx for any JSR/JSL fall-through. Returns (exit_m,
     exit_x) if the body decoded cleanly with an unambiguous exit
@@ -139,7 +174,8 @@ def _decode_variant_exit(rom: bytes, bank: int, addr16: int,
         graph = decode_function(rom, bank, addr16,
                                 entry_m=em, entry_x=ex, end=end,
                                 dispatch_helpers=dispatch_helpers,
-                                callee_exit_mx=callee_exit_mx)
+                                callee_exit_mx=callee_exit_mx,
+                                indirect_dispatch=indirect_dispatch)
     except Exception:
         return None
     if not graph.insns:
@@ -150,9 +186,62 @@ def _decode_variant_exit(rom: bytes, bank: int, addr16: int,
     return (exit_m & 1, exit_x & 1)
 
 
+# Result memo for detect_and_route (ported from perplexes/snesrecomp 71467b9,
+# 2026-06-30). The driver re-invokes the exit-mx autoroute on EVERY outer
+# auto-promote/emit pass (v2_regen.py), each time re-seeding
+# callee_exit_mx={} and re-running the full fixpoint from scratch — the
+# single biggest source of redundant decode in a regen (perplexes measured
+# ~82% of regen CPU here). But detect_and_route is a deterministic pure
+# function of (rom, dispatch_helpers, indirect_dispatch, and each cfg's
+# entry set + hand-written exit_mx_at directives); its ONLY side effect is
+# appending to each cfg.exit_mx_at_per_variant. So when an outer pass
+# presents inputs identical to a prior pass (the common case once
+# auto-promote stops adding entries), replay the recorded appends and skip
+# the entire fixpoint — zero decodes.
+_RESULT_MEMO: dict = {}
+
+
+def _route_signature(parsed, rom, dispatch_helpers, indirect_dispatch):
+    """Content signature of every input detect_and_route reads.
+
+    Two calls with equal signatures produce byte-identical output. Captures:
+    rom CONTENT (via hash(rom) — NOT id(rom): a real regen only ever loads
+    one ROM so id() would be stable there, but id() is unsafe in general —
+    short-lived bytes objects (e.g. per-test synthetic ROMs) routinely get
+    the same id() after GC reclaims the address, which would silently replay
+    a WRONG cached result for different ROM content; confirmed empirically
+    and caught as 4 new exit_mx_autoroute test failures during this port,
+    2026-06-30. hash(rom) matches decode_function's own base_key precedent),
+    dispatch_helpers + indirect_dispatch content, and for each (bank, cfg) in
+    iteration order its hand-written exit_mx_at directives and the ordered
+    (name, start, end) of every entry — the exact fields the seeding,
+    fixpoint, and emit steps consult."""
+    from v2.decoder import _freeze  # local import to avoid cycle at import time
+    cfg_sigs = []
+    for bank, _cfg_path, cfg in parsed:
+        entry_sig = tuple(
+            (e.name, e.start, e.end) for e in cfg.entries
+        )
+        exit_sig = tuple(sorted(
+            (b & 0xFF, a & 0xFFFF, m & 1, x & 1)
+            for (b, a, m, x) in cfg.exit_mx_at
+        ))
+        cfg_sigs.append((bank, exit_sig, entry_sig))
+    return (hash(rom), len(rom), _freeze(dispatch_helpers),
+            _freeze(indirect_dispatch), tuple(cfg_sigs))
+
+
 def detect_and_route(parsed, rom: bytes,
-                     dispatch_helpers=None) -> List[FixRecord]:
+                     dispatch_helpers=None,
+                     indirect_dispatch=None) -> List[FixRecord]:
     """Auto-detect per-variant function exit-(M, X) state.
+
+    `indirect_dispatch`: optional pc24-keyed map of `indirect_dispatch` /
+    `rts_dispatch` cfg directives (build via `build_indirect_dispatch_map`).
+    Without it, any function containing an RTS-trick site is decoded blind to
+    the trick, mis-analyzing its internal dispatch RTS as a real function
+    exit — see `build_indirect_dispatch_map`'s docstring for the ActRaiser
+    $03:9156 case this fixes.
 
     Algorithm:
 
@@ -217,9 +306,27 @@ def detect_and_route(parsed, rom: bytes,
     """
     fixes: List[FixRecord] = []
 
+    # Result-memo fast path (ported from perplexes/snesrecomp 71467b9,
+    # 2026-06-30): identical inputs across an outer pass -> replay the
+    # recorded per-variant appends and skip the whole fixpoint (no decode).
+    sig = _route_signature(parsed, rom, dispatch_helpers, indirect_dispatch)
+    memo = _RESULT_MEMO.get(sig)
+    if memo is not None:
+        captured_appends, cached_fixes = memo
+        for cfg, tup in captured_appends:
+            cfg.exit_mx_at_per_variant.append(tup)
+        return list(cached_fixes)
+
+    # Records THIS call's appends so the memo can replay them on a future hit.
+    captured_appends: List = []
+
     # Seed: cfg-declared 4-tuple exit_mx_at directives broadcast to
     # all 4 entry variants. Hand-written hints take precedence over
     # auto-detection — they are immutable for the rest of this run.
+    # The decode cache (enabled below for this fixpoint) keys each function's
+    # decode on the specific callee_exit_mx entries it queries, so re-decodes
+    # across fixpoint passes hit whenever a function's callee deps are
+    # unchanged — even as this dict is mutated in place.
     callee_exit_mx: dict = {}
     seeded_keys: Set[Tuple[int, int, int]] = set()
     for bank, _cfg_path, cfg in parsed:
@@ -234,46 +341,63 @@ def detect_and_route(parsed, rom: bytes,
     # cfg entry × every (em, ex); decodes under the current
     # callee_exit_mx; updates the entry if the derived exit differs
     # from what's stored. Stops when no entries change.
-    _MAX_ITERS = 12
-    for iter_n in range(_MAX_ITERS):
-        dirty = False
-        for bank, _cfg_path, cfg in parsed:
-            for entry in cfg.entries:
-                if not entry.name:
-                    continue
-                addr16 = entry.start & 0xFFFF
-                target_pc24 = (bank << 16) | addr16
-
-                for em, ex in _MX_COMBOS:
-                    key = (target_pc24, em, ex)
-                    if key in seeded_keys:
-                        continue  # hand-written hint is authoritative
-
-                    exit_pair = _decode_variant_exit(
-                        rom, bank, addr16, em, ex, entry.end,
-                        callee_exit_mx,
-                        dispatch_helpers=dispatch_helpers)
-                    if exit_pair is None:
-                        # Body decoded but exit is ambiguous, or
-                        # decode failed. Drop any prior record so
-                        # callers fall back to default-preserve
-                        # rather than relying on a stale stored
-                        # value. (Rare in practice — analyzer is
-                        # deterministic given inputs, so this only
-                        # fires when an upstream change introduces
-                        # ambiguity.)
-                        if key in callee_exit_mx:
-                            del callee_exit_mx[key]
-                            dirty = True
+    #
+    # Scope decode memoization to this fixpoint (perplexes/snesrecomp
+    # 71467b9). The dependency-keyed decode cache (decoder._ExitMxReader)
+    # lets fixpoint passes 2..N reuse pass-1 decodes for every function whose
+    # queried callee exits are unchanged — the bulk of the work, since most
+    # functions stabilise after the first pass. clear=False leaves cached
+    # graphs in place between passes; they are consulted only while enabled
+    # here, so interleaved emit/variant-discovery decodes stay uncached.
+    set_decode_cache_enabled(True, clear=False)
+    try:
+        _MAX_ITERS = 12
+        for iter_n in range(_MAX_ITERS):
+            dirty = False
+            for bank, _cfg_path, cfg in parsed:
+                for entry in cfg.entries:
+                    if not entry.name:
                         continue
+                    addr16 = entry.start & 0xFFFF
+                    target_pc24 = (bank << 16) | addr16
 
-                    prev = callee_exit_mx.get(key)
-                    if prev != exit_pair:
-                        callee_exit_mx[key] = exit_pair
-                        dirty = True
+                    for em, ex in _MX_COMBOS:
+                        key = (target_pc24, em, ex)
+                        if key in seeded_keys:
+                            continue  # hand-written hint is authoritative
 
-        if not dirty:
-            break
+                        exit_pair = _decode_variant_exit(
+                            rom, bank, addr16, em, ex, entry.end,
+                            callee_exit_mx,
+                            dispatch_helpers=dispatch_helpers,
+                            indirect_dispatch=indirect_dispatch)
+                        if exit_pair is None:
+                            # Body decoded but exit is ambiguous, or
+                            # decode failed. Drop any prior record so
+                            # callers fall back to default-preserve
+                            # rather than relying on a stale stored
+                            # value. (Rare in practice — analyzer is
+                            # deterministic given inputs, so this only
+                            # fires when an upstream change introduces
+                            # ambiguity.)
+                            if key in callee_exit_mx:
+                                del callee_exit_mx[key]
+                                dirty = True
+                            continue
+
+                        prev = callee_exit_mx.get(key)
+                        if prev != exit_pair:
+                            callee_exit_mx[key] = exit_pair
+                            dirty = True
+
+            if not dirty:
+                break
+    finally:
+        # Stop consulting/populating the cache for non-autoroute decodes, but
+        # keep cached graphs alive (clear=False) so the next outer-pass
+        # invocation can reuse them. Cleared at the next phase boundary
+        # (v2_regen.py calls clear_decode_cache() between phases).
+        set_decode_cache_enabled(False, clear=False)
 
     # Emit per-variant records AFTER fixpoint. Only `mutating`
     # entries (exit != entry) get cfg records; non-mutating exits
@@ -294,8 +418,9 @@ def detect_and_route(parsed, rom: bytes,
                     continue
                 exit_m, exit_x = pair
                 if exit_m != em or exit_x != ex:
-                    cfg.exit_mx_at_per_variant.append(
-                        (bank, addr16, em, ex, exit_m, exit_x))
+                    tup = (bank, addr16, em, ex, exit_m, exit_x)
+                    cfg.exit_mx_at_per_variant.append(tup)
+                    captured_appends.append((cfg, tup))
                     fixes.append(FixRecord(
                         bank=bank, addr16=addr16,
                         fn_name=entry.name,
@@ -303,6 +428,7 @@ def detect_and_route(parsed, rom: bytes,
                         exit_m=exit_m, exit_x=exit_x,
                     ))
 
+    _RESULT_MEMO[sig] = (captured_appends, fixes)
     return fixes
 
 

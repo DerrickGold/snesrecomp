@@ -155,6 +155,26 @@ def set_force_variant_at(d: Dict[int, Tuple[int, int]]) -> None:
     _FORCE_VARIANT_AT = dict(d) if d else {}
 
 
+# Per-function exit-check context, set by emit_function before it emits each
+# function's body and read by _emit_return. `_CUR_EXIT_NAME` is the current
+# function's C name (for exit-check attribution — g_last_recomp_func is stale
+# at a return, having been overwritten by any callee). `_CUR_EXIT_MX` is the
+# (exit_m, exit_x) this variant was recorded to exit with (what callers were
+# told via callee_exit_mx), or None when the analyzer left it ambiguous /
+# unrecorded — in which case the exit-mx check is skipped (no fixed expectation).
+_CUR_EXIT_NAME: str = ""
+_CUR_EXIT_MX = None
+
+
+def set_current_exit_ctx(func_name: str, exit_mx) -> None:
+    """emit_function calls this per-function before emitting the body so
+    _emit_return can attribute + validate the exit invariants (AR_EXITMX /
+    AR_EXITS). `exit_mx` is an (m, x) tuple or None."""
+    global _CUR_EXIT_NAME, _CUR_EXIT_MX
+    _CUR_EXIT_NAME = func_name or ""
+    _CUR_EXIT_MX = exit_mx if (exit_mx and exit_mx[0] is not None) else None
+
+
 def take_rejected_call_targets() -> set:
     """Return + clear the set of Call targets rejected as out-of-ROM.
     Diagnostic for v2_regen + tests."""
@@ -1486,7 +1506,27 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append("  }")
     lines.append(f"  static const uint16 _disp_n = {n};")
     lines.append("  if (_idx >= _disp_n) {")
-    if is_jsr_like:
+    if is_call_ret:
+        # PHA/RTS jump-table call (2026-06-30 fix): the PHY emitted just
+        # before this dispatch already pushed a 2- or 1-byte return frame
+        # (width = insn.x_flag at decode time, since no REP/SEP separates
+        # the PHY from this RTS) that only a DISPATCHED handler's own
+        # RTS/RTL would consume. An OOB index means no handler runs, so
+        # that frame would otherwise leak forever (N bytes per hit) — the
+        # ActRaiser $01:B898 sim-object-loop drift that caused the
+        # act->sim post-boss crash (a cfg table-size undercount let object
+        # types beyond the declared count hit this path; see
+        # recomp/bank01.cfg's `indirect_dispatch B8C0` comment). Undo the
+        # PHY so the whole compound PHY/PHA/RTS op is stack-neutral,
+        # matching a true no-op call — defense-in-depth for any other
+        # under-sized table, present or future.
+        _phy_bytes = 1 if getattr(insn, 'x_flag', 0) else 2
+        lines.append(
+            f"    (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _idx);")
+        lines.append(
+            f"    cpu->S = (uint16)(cpu->S + {_phy_bytes}u);  "
+            f"/* undo is_call_ret's pre-pushed PHY frame (OOB index) */")
+    elif is_jsr_like:
         # Non-terminal: dispatch_oob is a function that returns NORMAL,
         # but its return value is OUR caller's, not the dispatcher
         # block's. For a JSR/call dispatcher we fall through (out-of-range
@@ -1832,7 +1872,17 @@ def _emit_call(op: Call) -> List[str]:
         # JSL: PB save/restore wraps the switch. The propagation
         # block sits AFTER the PB restore so the caller's PB is
         # correct on the SKIP_N return path.
-        lines = ["{"]
+        lines = ["{",
+            # Stack-neutrality (NLR S-drift fix, ported from perplexes
+            # snesrecomp 3e89e72): a JSL paired with the callee's RTL is
+            # caller-neutral — the caller's S after a NORMAL return must equal
+            # its S before the return-frame push. Capture here; restore on the
+            # NORMAL path below. No-op when the callee balanced its own stack;
+            # CORRECTS the residual S drift a coroutine ancestor-skip leaves
+            # when its SKIP_N decrements to NORMAL at an intermediate call-site
+            # (our act->sim $03:8053 garbage-RTS class).
+            "  uint16 _call_s = cpu->S;",
+        ]
         lines += _emit_return_frame_push(op)
         lines += [
             "  uint8 _saved_pb = cpu->PB;",
@@ -1851,6 +1901,7 @@ def _emit_call(op: Call) -> List[str]:
             "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
             "    return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
             "  }",
+            "  cpu->S = _call_s;  /* stack-neutrality restore (see _call_s above) */",
             "}",
         ])
         return lines
@@ -1858,7 +1909,11 @@ def _emit_call(op: Call) -> List[str]:
     # NB: emit_function.py's per-line scanner auto-injects a
     # RecompStackPop() before any line whose stripped text starts with
     # "return" — that includes the SKIP propagation `return` below.
-    lines = ["{"]
+    lines = ["{",
+        # Stack-neutrality (see JSL path above): JSR + RTS is caller-neutral;
+        # restore S on the NORMAL path to correct coroutine ancestor-skip drift.
+        "  uint16 _call_s = cpu->S;",
+    ]
     lines += _emit_return_frame_push(op)
     lines += [
         "  RecompReturn _r;",
@@ -1876,6 +1931,7 @@ def _emit_call(op: Call) -> List[str]:
         "    cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);",
         "    return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));",
         "  }",
+        "  cpu->S = _call_s;  /* stack-neutrality restore (see _call_s above) */",
         "}",
     ])
     return lines
@@ -1955,6 +2011,20 @@ def _emit_return(op: Return) -> List[str]:
     label = "/* RTL */" if op.long else "/* RTS */"
     label_inner = "RTL" if op.long else "RTS"
     src24 = (op.source_pc24 or 0) & 0xFFFFFF
+    # Exit-invariant checks (AR_EXITMX / AR_EXITS), symmetric twins of the
+    # entry-mx check. `_exmx_call` validates the runtime exit (m,x) against the
+    # value recorded for callers (only when the analyzer recorded a definite
+    # exit); `_exs_call` flags a drifted stack on the paired-frame dispatch
+    # path. Both name the current function explicitly (g_last_recomp_func is
+    # stale at a return). No-op unless the matching env is set.
+    _exmx_call = (
+        f"    ar_exit_mx_check(cpu, {_CUR_EXIT_MX[0] & 1}, {_CUR_EXIT_MX[1] & 1}, "
+        f"\"{_CUR_EXIT_NAME}\", 0x{src24:06x}u);"
+    ) if _CUR_EXIT_MX else None
+    _exs_call = (
+        f"  ar_exit_s_check(cpu, _entry_s, _ret_s, "
+        f"\"{_CUR_EXIT_NAME}\", 0x{src24:06x}u);"
+    )
     lines = [
         f"{{ uint16 _ret_s = cpu->S;  /* {label_inner} pop hardware return frame */",
         "  cpu->S = (uint16)(cpu->S + 1);",
@@ -1982,6 +2052,7 @@ def _emit_return(op: Return) -> List[str]:
         f"  dbg_rts_trace(cpu, 0x{src24:06x}u, _entry_s, _ret_s, _rpc24, (uint8)_hrv);",
         "#endif",
         "  if (_hrv && _ret_s == _entry_s) {",
+        *([_exmx_call] if _exmx_call else []),
         f"    return RECOMP_RETURN_NORMAL;  /* {label_inner} host return */ }}",
         # Stack rebalanced shallower than this frame's entry (_ret_s !=
         # _entry_s): the function manually popped past its own return frame and
@@ -2056,6 +2127,14 @@ def _emit_return(op: Return) -> List[str]:
         # pushed params via entry_s + frame_size, so keep that — only the
         # shallow (net-pop) case switches. Hence max(_ret_s, _entry_s).
         f"  uint16 _miss_s = (uint16)(((_ret_s > _entry_s) ? _ret_s : _entry_s) + {frame_sz}u);",
+        # Any frame (paired OR dispatched) reaching its RTS/RTL with
+        # _ret_s != _entry_s and no ancestor parked there has a drifted
+        # stack, so _rpc24 is a garbage return about to be dispatched. Flag
+        # the culprit HERE, before branching on _hrv, so a DISPATCHED frame
+        # (_hrv==0 -> the TAILCALL path below) is covered too — most
+        # sim-mode object-loop / computed-dispatch functions are dispatched,
+        # not paired, and were previously invisible to this check entirely.
+        _exs_call,
         "  if (!_hrv) {",
         f"    cpu_tailcall_request(_rpc24, _miss_s, 0x{src24:06x}u);",
         f"    return RECOMP_RETURN_TAILCALL;  /* {label_inner} tail-dispatch (trampolined) */ }}",

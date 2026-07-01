@@ -57,6 +57,7 @@ from v2.tail_call_autoroute import (  # noqa: E402
 from v2.exit_mx_autoroute import (  # noqa: E402
     detect_and_route as autoroute_exit_mx,
     format_fix_summary as format_exit_mx_summary,
+    build_indirect_dispatch_map as _build_global_indirect_dispatch_map,
 )
 from v2.pha_rts_autoroute import (  # noqa: E402
     detect_and_route as autoroute_pha_rts,
@@ -429,6 +430,29 @@ def _rebuild_callee_exit_mx(parsed, variants: dict) -> tuple:
             declared_exit_mx[(b_id & 0xFF, addr16 & 0xFFFF)] = (
                 m_val, x_val)
 
+    # Precedence (2026-06-30): hand-written `exit_mx_at` OVERRIDES the
+    # auto-router's per-variant inference. Apply the auto-router FIRST, then
+    # let the human broadcast win. The auto-router is NOT always correct —
+    # e.g. ActRaiser $03:9156's exit-mx analyzer returns (1,0) because it reads
+    # the SEP #$20; RTS at the $9B59 rts_dispatch (an internal continuation
+    # jump) as an m=1 function exit, instead of the real $9195 REP->m=0
+    # terminal. That poisoned caller $03:8053's fall-through decode and crashed
+    # the act->sim transition. A `exit_mx_at` line is the intended manual
+    # override for exactly this "auto-inference is wrong" case, so it must take
+    # precedence. (Was reversed; see [[actsim-crash-nlr-fix]].)
+    per_variant_count = 0
+    for _bank, _cfg_path, cfg in parsed:
+        for (b_id, addr16, em_in, ex_in, ex_m, ex_xf) in \
+                cfg.exit_mx_at_per_variant:
+            target_pc24 = ((b_id & 0xFF) << 16) | (addr16 & 0xFFFF)
+            # A hand-written broadcast for this target overrides the
+            # auto-router entirely — skip the per-variant route for it.
+            if (b_id & 0xFF, addr16 & 0xFFFF) in declared_exit_mx:
+                continue
+            callee_exit_mx[(target_pc24, em_in & 1, ex_in & 1)] = (
+                ex_m & 1, ex_xf & 1)
+            per_variant_count += 1
+
     for (b_id, addr16), (ex_m, ex_xf) in declared_exit_mx.items():
         target_pc24 = (b_id << 16) | addr16
         mx_set = variants.get(target_pc24)
@@ -441,15 +465,6 @@ def _rebuild_callee_exit_mx(parsed, variants: dict) -> tuple:
             # default so early decode still gets the annotation.
             callee_exit_mx[(target_pc24, 1, 1)] = (ex_m, ex_xf)
             cfg_exit_mx_count += 1
-
-    per_variant_count = 0
-    for _bank, _cfg_path, cfg in parsed:
-        for (b_id, addr16, em_in, ex_in, ex_m, ex_xf) in \
-                cfg.exit_mx_at_per_variant:
-            target_pc24 = ((b_id & 0xFF) << 16) | (addr16 & 0xFFFF)
-            callee_exit_mx[(target_pc24, em_in & 1, ex_in & 1)] = (
-                ex_m & 1, ex_xf & 1)
-            per_variant_count += 1
 
     return (
         callee_exit_mx,
@@ -802,7 +817,13 @@ def main() -> int:
     watchdog.daemon = True
     watchdog.start()
 
-    set_decode_cache_enabled(False)  # hardcode off (cache key bug)
+    # Off by default outside the exit-mx autoroute's fixpoint. The old
+    # id()-based cache key never hit (2026-06-25 era); FIXED 2026-06-30
+    # (dependency-keyed memo ported from perplexes/snesrecomp 71467b9) —
+    # autoroute_exit_mx()/detect_and_route() now locally scope it on
+    # (clear=False) around its own fixpoint and back off after. See
+    # exit_mx_autoroute.py.
+    set_decode_cache_enabled(False)
     only_banks: set | None = None
     if args.banks:
         only_banks = set()
@@ -990,8 +1011,15 @@ def main() -> int:
     # GraphicsDecompress on 2026-05-03 and was reverted to opt-in).
     _phase("autoroute_exit_mx")
     print("Auto-detecting leaf-function exit-(M, X) mutations...")
+    # Global indirect_dispatch/rts_dispatch map (2026-06-30): without this the
+    # auto-router decodes any RTS-trick-bearing function BLIND to the trick,
+    # folding its internal dispatch RTS into the exit meet as a real exit —
+    # the ActRaiser $03:9156 bug (wrongly inferred (1,0) instead of the true
+    # (0,0)). See exit_mx_autoroute.build_indirect_dispatch_map.
+    _global_ind_dispatch = _build_global_indirect_dispatch_map(parsed)
     exit_mx_fixes = autoroute_exit_mx(parsed, rom,
-                                      dispatch_helpers=dispatch_helpers)
+                                      dispatch_helpers=dispatch_helpers,
+                                      indirect_dispatch=_global_ind_dispatch)
     print(format_exit_mx_summary(exit_mx_fixes))
 
     # Promote cross-bank `name` decls into target bank's emit entries.
@@ -1350,7 +1378,8 @@ def main() -> int:
         for _bank2, _cfg_path2, cfg2 in parsed:
             cfg2.exit_mx_at_per_variant.clear()
         exit_mx_fixes = autoroute_exit_mx(
-            parsed, rom, dispatch_helpers=dispatch_helpers)
+            parsed, rom, dispatch_helpers=dispatch_helpers,
+            indirect_dispatch=_build_global_indirect_dispatch_map(parsed))
         callee_exit_mx, _cfg_exit_count, _decl_exit_count, \
             _per_variant_count = _rebuild_callee_exit_mx(parsed, variants)
         callee_exit_mx_modes = _build_callee_exit_mx_modes(callee_exit_mx)
@@ -1849,7 +1878,8 @@ def main() -> int:
         for _bank2, _cfg_path2, cfg2 in parsed:
             cfg2.exit_mx_at_per_variant.clear()
         refreshed_exit_mx_fixes = autoroute_exit_mx(
-            parsed, rom, dispatch_helpers=dispatch_helpers)
+            parsed, rom, dispatch_helpers=dispatch_helpers,
+            indirect_dispatch=_build_global_indirect_dispatch_map(parsed))
         callee_exit_mx = {}
         cfg_exit_mx_count = 0
         declared_exit_mx = {}

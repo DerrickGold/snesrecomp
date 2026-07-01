@@ -1061,6 +1061,13 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
             void *bt[24];
             int n = backtrace(bt, 24);
             backtrace_symbols_fd(bt, n, 2);
+            /* Snapshot the dispatch ring at the first garbage access — the
+             * crash usually aborts before DumpDiagState, so capture the
+             * last-N dispatches feeding into the leak right here. */
+            extern void CpuDispatchLogWriteFile(const char *path);
+            CpuDispatchLogWriteFile("saves/crash_dispatch_log.json");
+            fprintf(stderr, "[ppu_read] dispatch ring -> "
+                    "saves/crash_dispatch_log.json\n");
           }
         }
       }
