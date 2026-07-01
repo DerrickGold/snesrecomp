@@ -359,12 +359,23 @@ def load_bank_cfg(path: str) -> BankCfg:
                 idx_reg: Optional[str] = None
                 table_bases: Tuple[int, ...] = ()
                 ret_pc16: Optional[int] = None
+                sep_mask: int = 0
                 for t in tokens[3:]:
                     if t.startswith('idx:'):
+                        # idx:A — value-keyed PHA/RTS dispatch: the PHA'd A
+                        # value IS the handler address (handler-1, classic RTS
+                        # jump table), loaded via arbitrary indirection the
+                        # index-keyed form can't express (e.g. ActRaiser
+                        # $03:F5BE's per-town two-level table walk: outer
+                        # table $03:F5ED[town] -> inner $FFFF-terminated
+                        # handler list walked with X as an absolute ROM
+                        # pointer). The emitted switch keys on (cpu->A &
+                        # 0xFFFF) matched against the raw table words, so it
+                        # is correct regardless of how the value was loaded.
                         v = t[len('idx:'):].upper()
-                        if v not in ('X', 'Y'):
+                        if v not in ('X', 'Y', 'A'):
                             raise ValueError(
-                                f"{path}: indirect_dispatch idx: must be X or Y, got {v!r}")
+                                f"{path}: indirect_dispatch idx: must be X, Y or A, got {v!r}")
                         idx_reg = v
                     elif t.startswith('ret:'):
                         # ret:<pc16> — the PHA/RTS jump table is a CALL, not a
@@ -390,18 +401,40 @@ def load_bank_cfg(path: str) -> BankCfg:
                         except ValueError as e:
                             raise ValueError(
                                 f"{path}: indirect_dispatch tables: bad hex {t!r}: {e}")
+                    elif t.startswith('sep:'):
+                        # sep:<hexmask> — the real code executes SEP #<mask>
+                        # BETWEEN the PHA and the dispatching RTS (e.g.
+                        # ActRaiser $03:F5BE: PHA; SEP #$20; RTS), so the
+                        # handlers genuinely enter with those flag bits SET.
+                        # The dispatch replaces the PHA+SEP+RTS wholesale, so
+                        # the emitter must apply the SEP itself before the
+                        # switch, and the decoder must decode the handlers at
+                        # the SEP'd (m,x) — otherwise the handlers misdecode
+                        # (their immediates split) and the runtime variant
+                        # switch picks the wrong body.
+                        try:
+                            sep_mask = _parse_hex(t[len('sep:'):]) & 0xFF
+                        except ValueError as e:
+                            raise ValueError(
+                                f"{path}: indirect_dispatch sep: bad hex {t!r}: {e}")
                     else:
                         raise ValueError(
                             f"{path}: indirect_dispatch unknown option {t!r}")
                 if idx_reg is None:
                     raise ValueError(
-                        f"{path}: indirect_dispatch needs idx:X or idx:Y — got: {stripped!r}")
+                        f"{path}: indirect_dispatch needs idx:X, idx:Y or idx:A — got: {stripped!r}")
+                if idx_reg == 'A' and not table_bases:
+                    raise ValueError(
+                        f"{path}: indirect_dispatch idx:A needs tables:<base> "
+                        f"(the value set must be enumerable at regen time) — "
+                        f"got: {stripped!r}")
                 cfg.indirect_dispatch.append({
                     'site_pc16': site_pc16,
                     'count': count,
                     'idx_reg': idx_reg,
                     'table_bases': table_bases,
                     'ret_pc16': ret_pc16,
+                    'sep_mask': sep_mask,
                 })
                 continue
 

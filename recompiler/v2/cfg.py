@@ -96,7 +96,17 @@ def _identify_leaders(graph: FunctionDecodeGraph,
     leaders: Set[DecodeKey] = {graph.entry}
 
     for key, di in graph.insns.items():
-        if di.insn.mnem in _BLOCK_ENDERS:
+        # Block-ender by mnemonic (RTS/JMP/branches/...), OR any insn
+        # whose successor count isn't exactly 1 — e.g. a cfg `indirect_dispatch`
+        # stamped on a non-branch mnemonic like PHA (the PHA/RTS jump-table
+        # idiom: the dispatch itself lives on the PHA, not the RTS, and can
+        # fan out to N handler entries plus a `ret:` continuation). Mirrors
+        # `_build_blocks`'s own `len(successors) != 1` fallback below, which
+        # already treats such an insn as ending ITS block — without this,
+        # the successor side (e.g. a `ret:` continuation) never becomes a
+        # leader, gets no block/label, and the emitted `goto L_<ret>` in
+        # codegen's dispatch switch references an undeclared label.
+        if di.insn.mnem in _BLOCK_ENDERS or len(di.successors) != 1:
             for s in di.successors:
                 # Successor may be outside the graph (cross-bank, indirect);
                 # only mark it as a leader if it's actually decoded here.

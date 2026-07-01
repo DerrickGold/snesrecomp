@@ -96,6 +96,84 @@ def _detect_garbage_variant(rom, bank, start, entry_m, entry_x, graph, end):
     return None
 
 
+def _find_equivalent_variants(rom, bank, start, entry_m, entry_x, graph,
+                               end) -> List[Tuple[int, int]]:
+    """Return the list of valid sibling (m, x) widths PROVEN equivalent
+    to this (entry_m, entry_x) variant's decode, for the emit-truth
+    prune's routing decision (codegen._route_pruned_variant).
+
+    "Proven equivalent" means: every (pc16, mnemonic, operand length)
+    this variant's decoder actually produced ALSO appears, identically,
+    in the sibling's own decode at the same pc16. This is a coverage
+    check, not a control-flow walk: if a function normalizes one flag
+    (e.g. `REP #$20`) before any flag-sensitive instruction executes,
+    every PC this variant reaches will decode identically regardless of
+    the OTHER (unnormalized) flag's entry value, so the check passes
+    vacuously true everywhere. If some flag-sensitive instruction (e.g.
+    `LDX #imm`) decodes to a different operand length at a shared PC,
+    that PC fails the check and the sibling is rejected outright — this
+    is exactly the class of bug that misrouted $01:B898's pruned M1X0
+    dispatch case to the wrong-width M1X1 body (2026-06-30/07-01): M1X1
+    was never actually equivalent to M1X0, just assumed to be by a
+    generic "nearest by (m,x) distance" heuristic with no proof behind
+    it.
+
+    Requires the reachable PC set to be non-trivial (more than just the
+    shared entry point) so a degenerate/empty decode can't vacuously
+    "match" everything — that would prove nothing.
+
+    Deliberately does NOT gate on codegen.have_valid_variants() /
+    valid_variant_list() the way the older _detect_garbage_variant does.
+    Those reflect the emit-truth prune's CURRENT survivor set, which is
+    empty on pass 0 and only gets populated as pruning proceeds — but a
+    variant with a cfg-declared canonical (entry_mx:) can be pruned
+    immediately after pass 0, before it's ever re-decoded at a later
+    pass where that gate would be open. Gating this check the same way
+    made it silently never fire for exactly that (fast, common) case —
+    found via the $01:B898 regen report investigation (2026-07-01): the
+    check proved correct in isolation but the pruned M1X0 case never
+    appeared in cumulative_equivalences at all. Comparing against all 3
+    other raw (m, x) combos unconditionally avoids the race: the
+    equivalence fact needs to exist BEFORE prune/valid-variant state is
+    settled, since that's what it's meant to inform.
+
+    Cheap: decode_function results are cache-keyed by (rom identity,
+    bank, start, m, x, end), so re-decoding a sibling already emitted
+    elsewhere in this same pass is a cache hit, not a fresh decode.
+    """
+    this_shape: Dict[int, Tuple[str, int]] = {}
+    for k, di in graph.insns.items():
+        pc16 = k.pc & 0xFFFF
+        length = getattr(di.insn, 'length', 0) or 0
+        this_shape[pc16] = (di.insn.mnem, length)
+    if len(this_shape) < 2:
+        # Degenerate/near-empty decode (e.g. entry insn only) — no real
+        # evidence either way. Don't claim equivalence.
+        return []
+    all_combos = ((0, 0), (0, 1), (1, 0), (1, 1))
+    equivalents: List[Tuple[int, int]] = []
+    for sm, sx in all_combos:
+        if (sm, sx) == (entry_m & 1, entry_x & 1):
+            continue
+        try:
+            sg = decode_function(rom, bank, start, sm & 1, sx & 1, end=end)
+        except Exception:
+            continue
+        sib_shape: Dict[int, Tuple[str, int]] = {}
+        for k2, di2 in sg.insns.items():
+            pc16 = k2.pc & 0xFFFF
+            length2 = getattr(di2.insn, 'length', 0) or 0
+            sib_shape[pc16] = (di2.insn.mnem, length2)
+        covered = True
+        for pc16, shape in this_shape.items():
+            if sib_shape.get(pc16) != shape:
+                covered = False
+                break
+        if covered:
+            equivalents.append((sm & 1, sx & 1))
+    return equivalents
+
+
 def _stack_width_for_a(insn) -> int:
     return 1 if (getattr(insn, 'm_flag', 1) & 1) else 2
 
@@ -423,6 +501,7 @@ def emit_function(rom: bytes, bank: int, start: int,
                   const_z_fold_collector=None,
                   dispatch_target_suppressed_collector=None,
                   unresolved_indirect_collector=None,
+                  equivalence_collector=None,
                   data_regions=None,
                   exclude_ranges: Optional[List[Tuple[int, int]]] = None,
                   tail_call_pc16: Optional[int] = None,
@@ -518,6 +597,19 @@ def emit_function(rom: bytes, bank: int, start: int,
     # to the misdecode root than the downstream crash, no oracle needed.
     _garbage_brk_pc = _detect_garbage_variant(
         rom, bank, start, entry_m, entry_x, graph, end)
+    # Proven-equivalence check (2026-07-01): for every valid sibling
+    # width, prove (or refute) that it's a safe substitute for THIS
+    # variant via a full instruction-shape coverage check (see
+    # _find_equivalent_variants docstring). Feeds codegen's
+    # _route_pruned_variant so a pruned dispatch case routes to a
+    # sibling PROVEN equivalent, not one merely assumed to be by the
+    # generic (m,x)-distance heuristic.
+    if equivalence_collector is not None:
+        func_entry_pc24 = addr24(bank, start)
+        for (sm, sx) in _find_equivalent_variants(
+                rom, bank, start, entry_m, entry_x, graph, end):
+            equivalence_collector.append(
+                (func_entry_pc24, entry_m & 1, entry_x & 1, sm, sx))
     # Forward any suppressed indirect calls upward so emit_bank can
     # aggregate them into the build report. List-of-records.
     if suppressed_collector is not None:

@@ -120,8 +120,11 @@ static void readHeader(const uint8_t* data, int length, int location, CartHeader
   header->type = data[location + 0x15] & 0xf;
   header->coprocessor = data[location + 0x16] >> 4;
   header->chips = data[location + 0x16] & 0xf;
-  header->romSize = 0x400 << data[location + 0x17];
-  header->ramSize = 0x400 << data[location + 0x18];
+  /* header-candidate probing hits garbage bytes here; clamp the shift count
+   * (UB for >=22 on a 32-bit int, and any such value is a bogus header that
+   * the location scoring rejects anyway) */
+  header->romSize = (data[location + 0x17] < 22) ? (0x400 << data[location + 0x17]) : 0;
+  header->ramSize = (data[location + 0x18] < 22) ? (0x400 << data[location + 0x18]) : 0;
   header->region = data[location + 0x19];
   header->maker = data[location + 0x1a];
   header->version = data[location + 0x1b];

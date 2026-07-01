@@ -1788,7 +1788,15 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     # targets are table_value + 1 (the table stores handler-1,
                     # the classic RTS jump-table idiom). _resolve returns the
                     # raw table words; apply the +1 within the same bank.
-                    entries = [None if (e is None or e == 0)
+                    # Guard: a resulting 16-bit PC below $8000 is not LoROM
+                    # code — it's a table TERMINATOR ($FFFF+1 wraps to $0000;
+                    # ActRaiser $03:F5F9's per-town lists are $FFFF-terminated
+                    # and packed, so the enumerating table window necessarily
+                    # spans them) or padding. Null those entries so neither
+                    # the decode successors nor the emitted switch reference
+                    # a garbage bank_XX_0000 target.
+                    entries = [None if (e is None or e == 0
+                                        or ((e + 1) & 0xFFFF) < 0x8000)
                                else ((e & 0xFF0000) | ((e + 1) & 0xFFFF))
                                for e in entries]
                     insn.dispatch_entries = entries
@@ -1796,16 +1804,30 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                                           else 'short')
                     insn.dispatch_idx_reg = auth['idx_reg']
                     insn.dispatch_table_bases = tuple(auth.get('table_bases', ()) or ())
+                    # `sep:<mask>` => the real code executes SEP #<mask>
+                    # between this PHA and the dispatching RTS (both replaced
+                    # by the emitted switch), so handlers enter with those P
+                    # bits SET. Decode them at that state and tell the emitter
+                    # to apply the SEP before the switch.
+                    sep_mask = int(auth.get('sep_mask') or 0)
+                    insn.dispatch_sep = sep_mask
                     # `ret:<pc16>` => this PHA/RTS jump table is a CALL (a return
                     # addr was pushed before the handler addr), so handlers RTS
                     # back to the in-function continuation; it is NOT terminal.
                     # Decode the handlers + the continuation at the SITE's (m,x)
-                    # (a call preserves the caller's width), not forced 8-bit.
+                    # (a call preserves the caller's width), not forced 8-bit —
+                    # except bits named by sep:<mask>, which are set for the
+                    # handlers (the SEP executes before the dispatch on real HW;
+                    # the ret continuation is reached AFTER the handler returns,
+                    # still at the SEP'd state — its own code REPs back if the
+                    # original did, e.g. $03:F5E3's REP #$20).
                     ret_pc16 = auth.get('ret_pc16')
                     insn.dispatch_ret = ret_pc16
                     insn.dispatch_terminal = (ret_pc16 is None)
-                    succ_m = 1 if insn.dispatch_terminal else (insn.m_flag & 1)
-                    succ_x = 1 if insn.dispatch_terminal else (insn.x_flag & 1)
+                    succ_m = 1 if (insn.dispatch_terminal or (sep_mask & 0x20)) \
+                        else (insn.m_flag & 1)
+                    succ_x = 1 if (insn.dispatch_terminal or (sep_mask & 0x10)) \
+                        else (insn.x_flag & 1)
                     labeled_succ = []
                     for e in entries:
                         if e is None or e == 0:

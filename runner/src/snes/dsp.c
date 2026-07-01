@@ -412,10 +412,15 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
       s = curByte >> 4;
     }
     if(s > 7) s -= 16;
+    /* s can be negative here (BRR nibble sign-extended to [-8,7]); left-
+     * shifting a negative signed int is UB in C (UBSan: "left shift of
+     * negative value", 2026-06-30). Hardware just moves bits regardless of
+     * sign, so shift the unsigned reinterpretation and cast back -- same
+     * bit pattern, well-defined. */
     if(shift <= 0xc) {
-      s = (s << shift) >> 1;
+      s = (int)((unsigned)s << shift) >> 1;
     } else {
-      s = (s >> 3) << 12;
+      s = (int)((unsigned)(s >> 3) << 12);
     }
     switch(filter) {
       case 1: s += old + (-old >> 4); break;

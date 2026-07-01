@@ -12,6 +12,7 @@
 #include <setjmp.h>
 #include <string.h>
 #include <time.h>
+#include <execinfo.h>
 
 Snes *g_snes;
 Cpu *g_snes_cpu;
@@ -120,6 +121,47 @@ void ar_mxhist_dump(void) {
   }
   fprintf(stderr, "[mxhist] %d multi-combo PCs\n", n);
   fflush(stderr);
+  /* AR_FNCENSUS=1: dump EVERY recorded function-entry PC (not just the
+   * multi-combo ones) with per-(m,x) counts to saves/fn_census.txt. The
+   * decisive tool for never-runs bugs: a routine that exists in the binary
+   * but is missing from the census was never entered at all -- its trigger
+   * upstream never fired (no tripwire can catch code that doesn't run). */
+  if (getenv("AR_FNCENSUS")) {
+    FILE *f = fopen("saves/fn_census.txt", "w");
+    if (f) {
+      unsigned total = 0;
+      for (unsigned j = 0; j < MXHIST_CAP; j++) {
+        if (!g_mxhist[j].pc) continue;
+        fprintf(f, "%06X %u %u %u %u\n", g_mxhist[j].pc,
+                g_mxhist[j].cnt[0], g_mxhist[j].cnt[1],
+                g_mxhist[j].cnt[2], g_mxhist[j].cnt[3]);
+        total++;
+      }
+      fclose(f);
+      fprintf(stderr, "[fncensus] wrote saves/fn_census.txt (%u PCs)\n", total);
+    }
+  }
+}
+
+/* AR_ADADTRACE=1 (2026-07-01, temporary probe): every entry to bank_01_ADAD*
+ * (sim-mode decoration-object OAM-record writer) -- prints X (the per-object
+ * index into the DB-relative source table) and DB, plus the raw source words
+ * at DB:$000a+X / $000c+X / $0008+X it's about to copy into the WRAM record.
+ * Chasing the ~46 identical duplicate decoration sprites (x=77,y=44,tile=0x55)
+ * stuck in WRAM $03E8-$047F -- unclear if X fails to advance between calls
+ * (loop-index bug) or the SOURCE table itself is uniformly blank (all-same
+ * legitimately, meaning the bug is upstream of this function). */
+void ar_adad_trace(CpuState *cpu, const char *fn, uint32_t pc24) {
+  if (!getenv("AR_ADADTRACE") || !fn || !strstr(fn, "bank_01_ADAD")) return;
+  extern int snes_frame_counter;
+  static int n;
+  if (n++ >= 60000) return;
+  uint16 v0a = cpu_read16(cpu, cpu->DB, (uint16)(0x000a + cpu->X));
+  uint16 v0c = cpu_read16(cpu, cpu->DB, (uint16)(0x000c + cpu->X));
+  uint16 v08 = cpu_read16(cpu, cpu->DB, (uint16)(0x0008 + cpu->X));
+  fprintf(stderr, "[adadtrace] %s (%06X) f=%d X=$%04X DB=$%02X D=$%04X "
+          "src[+0a]=$%04X src[+0c]=$%04X src[+08]=$%04X\n",
+          fn, pc24, snes_frame_counter, cpu->X, cpu->DB, cpu->D, v0a, v0c, v08);
 }
 
 /* AR_TRAPFN=<substring>: the first time a function whose name contains the
@@ -127,6 +169,38 @@ void ar_mxhist_dump(void) {
  * the runtime m/x flags. Used to find the dispatch chain that reached a
  * known-garbage misdecode variant (e.g. AR_TRAPFN=bank_03_AC8E_M1X0) -> the
  * caller between the legit entry and the wrong-m variant is the leak site. */
+/* Always-on indirect-dispatch OOB tripwire (2026-07-02). Generated code
+ * calls cpu_trace_dispatch_oob when a runtime index exceeds the cfg
+ * `indirect_dispatch` count; in non-trace builds that used to compile to
+ * a SILENT no-op — which hid the sim-mode actor-spawn root cause (B8C0's
+ * idx:X switch computed _idx from a PLX-restored record pointer, so the
+ * OOB arm ran on every typed record every frame for weeks with zero
+ * output). Deduped per (site, idx), capped, one loud line each — same
+ * philosophy as the [dispatch-miss] tripwire. AR_NOOOBWARN=1 silences. */
+RecompReturn ar_dispatch_oob_warn(CpuState *cpu, uint32_t site_pc24, uint16_t idx) {
+  static int off = -1;
+  if (off < 0) off = getenv("AR_NOOOBWARN") ? 1 : 0;
+  if (off) return RECOMP_RETURN_NORMAL;
+  static struct { uint32_t site; uint16_t idx; } seen[64];
+  static int nseen, capped;
+  for (int i = 0; i < nseen; i++)
+    if (seen[i].site == site_pc24 && seen[i].idx == idx) return RECOMP_RETURN_NORMAL;
+  if (nseen >= 64) {
+    if (!capped) { capped = 1; fprintf(stderr, "[dispatch-oob] (further sites suppressed, table full)\n"); }
+    return RECOMP_RETURN_NORMAL;
+  }
+  seen[nseen].site = site_pc24; seen[nseen].idx = idx; nseen++;
+  extern int snes_frame_counter;
+  fprintf(stderr,
+      "[dispatch-oob] site=$%06X idx=%u exceeds cfg count -- dispatch SKIPPED "
+      "(m=%u x=%u X=$%04X A=$%04X S=$%04X f=%d func=%s). Always a real bug: "
+      "cfg count too small, wrong idx model (idx:X after a PLX? use idx:A), "
+      "or register corruption.\n",
+      site_pc24, (unsigned)idx, cpu->m_flag & 1, cpu->x_flag & 1,
+      cpu->X, cpu->A, cpu->S, snes_frame_counter, g_last_recomp_func);
+  return RECOMP_RETURN_NORMAL;
+}
+
 const char *g_ar_trapfn = 0;
 void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32_t pc24) {
   if (!g_ar_trapfn || !fn || !strstr(fn, g_ar_trapfn)) return;
@@ -259,6 +333,27 @@ void ar_entry_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32_t pc
     "  (caller=%s)\n",
     fn, pc24, cpu->m_flag & 1, cpu->x_flag & 1, em, ex,
     caller ? caller : "?");
+  /* 2026-06-30: AR_MXCHECK_BT dumps the REAL host C call stack (backtrace(),
+   * same mechanism the ppu_read crash handler uses) for a specific function
+   * name substring -- bypasses g_recomp_stack entirely, so it's independent
+   * of any bug/assumption in our OWN stack-bookkeeping instrumentation. Added
+   * chasing $01:B898_M1X1: every g_recomp_stack-based diagnostic (AR_CALLMX,
+   * AR_TRAPFN, [b898log] in _cpu_dispatch_once) proved the caller ISN'T
+   * 933C_M1X0's own switch (that call site is provably clean) and ISN'T a
+   * computed/miss dispatch (b898log never fires) -- yet g_recomp_stack shows
+   * exactly [933C_M1X0, B898_M1X1]. This settles it directly: the true
+   * compiled call chain, independent of any of that. */
+  {
+    static int done;
+    const char *want = getenv("AR_MXCHECK_BT");
+    if (want && !done && strstr(fn, want)) {
+      done = 1;
+      void *bt[32];
+      int n = backtrace(bt, 32);
+      fprintf(stderr, "[mxcheck-bt] real C call stack for %s:\n", fn);
+      backtrace_symbols_fd(bt, n, 2);
+    }
+  }
   fflush(stderr);
 }
 
@@ -326,6 +421,22 @@ void ar_call_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32_t pc2
     "  f=%d\n",
     fn ? fn : "?", pc24, cpu->m_flag & 1, cpu->x_flag & 1, em, ex,
     snes_frame_counter);
+  /* Block-history ring (pc m x S), oldest-first: shows the path INTO the
+   * failing call site, i.e. the block where the runtime flag diverged from
+   * the decoder's assumption. Same format as the trapfn/watchdog dumps. */
+  {
+    extern uint32_t g_ar_blk_ring[], g_ar_blk_aux[];
+    extern uint16_t g_ar_blk_s[];
+    extern unsigned g_ar_blk_idx;
+    fprintf(stderr, "[call-mx] last 48 blocks (pc m x S X), oldest-first:\n");
+    for (int i = 48; i >= 1; i--) {
+      unsigned j = (g_ar_blk_idx - (unsigned)i) & 1023u;
+      uint32_t aux = g_ar_blk_aux[j];
+      fprintf(stderr, "    %06X m=%u x=%u S=%04X X=%04X\n",
+              g_ar_blk_ring[j], (aux >> 16) & 1, (aux >> 17) & 1,
+              g_ar_blk_s[j], aux & 0xFFFF);
+    }
+  }
   fflush(stderr);
 }
 

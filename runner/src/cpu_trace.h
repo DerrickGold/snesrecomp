@@ -1390,6 +1390,74 @@ static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
       }
     }
   }
+  /* AR_SIMTRACE=1 (2026-07-01): sim-mode per-frame freeze investigation. Bank 0
+   * $0080EA dispatches sim-mode processing: `JSL $018000` (the sim-mode building/
+   * icon update, $0080F0) then `BCS $8125` (skip the REST of the per-frame update
+   * -- $2AFF8/$1B21B/$1ACD9/$3D06A/etc -- if $018000 returned carry set). A static
+   * trace of $018000 with the values seen in an F2 snapshot ($0347=0, $00A1=0,
+   * $7F9750=0) suggested it should return carry CLEAR (continue normally), so if
+   * the game is actually frozen every frame, the skip must be happening -- or the
+   * freeze is further downstream. Rather than inspect the carry flag mid-block
+   * (hard with only per-BLOCK granularity), watch which of the two branch targets
+   * actually executes each frame: $008125 (skip path) vs $0080F6 (continue path).
+   * Also watched: $008066 (action-stage path -- should NEVER fire while $18==0)
+   * and $0080E5 (sim-dispatch entry, confirms the outer gate is even reached). */
+  {
+    static int st_en = -1;
+    if (st_en < 0) st_en = getenv("AR_SIMTRACE") ? 1 : 0;
+    if (st_en && (pc24 == 0x008125u || pc24 == 0x0080F6u || pc24 == 0x008106u
+                  || pc24 == 0x008066u || pc24 == 0x0080E5u)) {
+      static int lines;
+      if (lines < 600) {
+        lines++;
+        extern int snes_frame_counter;
+        extern uint8 g_ram[0x20000];
+        unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+        const char *tag = (pc24 == 0x008125u) ? "SKIP-rest-of-update"
+                         : (pc24 == 0x0080F6u) ? "CONTINUE-full-update"
+                         : (pc24 == 0x008106u) ? "second-$19-check"
+                         : (pc24 == 0x008066u) ? "action-stage-path(!)"
+                         : "sim-dispatch-entry";
+        /* D added 2026-07-01: `LDA $19` at $008106 is direct-page addressing
+         * (D + $0019, NOT literal $0019) -- the AR_WATCHOBJ=0 watch found
+         * nothing because it was pointed at literal $0000-$003F while the
+         * real read/write target is wherever D actually is. This names the
+         * real address so the watch can be re-aimed correctly. */
+        fprintf(stderr, "[simtrace] gf=%u f=%d pc=$%06X %s A=%04x X=%04x D=%04x "
+                "(effective $19 addr = $%04x)\n",
+                gf, snes_frame_counter, pc24, tag, cpu->A, cpu->X, cpu->D,
+                (uint16)(cpu->D + 0x0019));
+        if (lines == 600) fprintf(stderr, "[simtrace] (cap 600 reached)\n");
+      }
+    }
+  }
+  /* AR_SAVECHECK=1 (2026-07-01): which branch the save-data checksum gate
+   * (bank_02_A622, $02A70D `BCC $A72F`) actually takes. $02A88D computes a
+   * checksum over the SRAM save data ($700000-$701FEB) and compares
+   * against stored expected values at $701FEC/$701FEE; BCC (carry clear)
+   * means the checksum PASSED -> $A72F (the "continue saved game" title-
+   * screen flow: 3 dialog messages, sets $0336=1). Carry SET means FAILED
+   * -> $A70F (the "no valid save / new game" flow: 2 messages, $0336 left
+   * untouched). Neither branch is a crash handler -- both are normal
+   * title-screen dialog flows -- but if the recomp's checksum computation
+   * ever disagrees with real hardware for the SAME save file, it takes
+   * the WRONG one of these two branches relative to what the player's
+   * save actually represents, leaving whatever state the "continue" path
+   * is responsible for setting up (e.g. $0336, and anything gated on it
+   * downstream) missing or wrong -- a plausible root cause for state
+   * corruption that only surfaces much later, far from this code. */
+  {
+    static int sc_en = -1;
+    if (sc_en < 0) sc_en = getenv("AR_SAVECHECK") ? 1 : 0;
+    if (sc_en && (pc24 == 0x02A72Fu || pc24 == 0x02A70Fu)) {
+      extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+      unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+      fprintf(stderr, "[savecheck] gf=%u f=%d pc=$%06X %s\n",
+              gf, snes_frame_counter, pc24,
+              pc24 == 0x02A72Fu ? "PASS (continue saved game)"
+                                 : "FAIL (no valid save / new game)");
+    }
+  }
   /* AR_SCHECK=1: pinpoint SNES stack-pointer corruption. The act->sim transition
    * crashes with S walked to $2133 (the I/O register range) -> pushes/pops
    * scribble hardware. ActRaiser legitimately relocates the stack to various
@@ -1671,10 +1739,16 @@ static inline RecompReturn cpu_trace_unresolved_stub_trap(
     (void)c; (void)t; (void)fn;
     return RECOMP_RETURN_NORMAL;
 }
+/* Production dispatch-OOB: NOT silent (2026-07-02). An OOB index at an
+ * `indirect_dispatch` site is always a real bug (cfg count too small,
+ * wrong idx model, register corruption) — the sim-mode actor-spawn bug
+ * ran the OOB arm on every typed record for WEEKS with zero output
+ * because this stub compiled the trap away in non-trace builds. Delegate
+ * to the always-compiled deduped warner in common_cpu_infra.c. */
+RecompReturn ar_dispatch_oob_warn(CpuState *c, uint32_t site_pc24, uint16_t idx);
 static inline RecompReturn cpu_trace_dispatch_oob(
     CpuState *c, uint32_t s, uint16_t i) {
-    (void)c; (void)s; (void)i;
-    return RECOMP_RETURN_NORMAL;
+    return ar_dispatch_oob_warn(c, s, i);
 }
 
 /* Init + boundary-audit stubs — direct callers in main.c and

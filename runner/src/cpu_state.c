@@ -232,6 +232,30 @@ uint8 cpu_read8(CpuState *cpu, uint8 bank, uint16 addr) {
                 }
             }
         }
+        /* AR_READ0019=1 (2026-07-01, temporary probe): unconditional read
+         * watch on $0019. Every WRAM-write mechanism (cpu_write8/16,
+         * IndirWriteByte/Word, DMA via snes_write) has been instrumented
+         * and shows ZERO writes setting $0019 to 0xA1, yet AR_SIMTRACE
+         * shows it being read as 0xA1 mid-frame. Logging the read side
+         * directly (with block PC via g_last_recomp_func) settles whether
+         * the value is really there, and whichever read call actually
+         * observes it narrows down what's between the (apparently absent)
+         * write and this read. */
+        if (off == 0x19 && getenv("AR_READ0019")) {
+            static int n;
+            if (n++ < 20000) {
+                extern int snes_frame_counter; extern const char *g_last_recomp_func;
+                extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                fprintf(stderr, "[read0019] $0019=%02x f=%d cur=%s m=%u x=%u A=%04x X=%04x D=%04x PB=%02x DB=%02x stk:",
+                        cpu->ram[off], snes_frame_counter,
+                        g_last_recomp_func ? g_last_recomp_func : "?",
+                        (unsigned)cpu->m_flag, (unsigned)cpu->x_flag, cpu->A, cpu->X, cpu->D,
+                        cpu->PB, cpu->DB);
+                for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+                    fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                fprintf(stderr, "\n");
+            }
+        }
         return cpu->ram[off];
     }
     if (is_hw_reg(bank, addr)) {
@@ -273,10 +297,66 @@ uint16 cpu_read16(CpuState *cpu, uint8 bank, uint16 addr) {
     return (uint16)p[0] | ((uint16)p[1] << 8);
 }
 
+void ar_indirect_suppressed_log(CpuState *cpu, uint32 site_pc24,
+                                 uint8 bank, uint16 table_base, uint16 x_reg) {
+    if (!getenv("AR_INDIRLOG")) return;
+    static uint32_t seen[128]; static int nseen;
+    for (int i = 0; i < nseen; i++) if (seen[i] == site_pc24) return;
+    if (nseen < 128) seen[nseen++] = site_pc24;
+
+    extern int snes_frame_counter;
+    uint32 eff = (uint32)table_base + x_reg;
+    fprintf(stderr, "[indirlog] site=$%06X table=$%02X:%04X (eff=$%04X, X=$%04X) "
+            "m=%u x=%u f=%d\n", site_pc24, bank, table_base, eff & 0xFFFFu, x_reg,
+            (unsigned)cpu->m_flag, (unsigned)cpu->x_flag, snes_frame_counter);
+
+    int off = cpu_ram_offset(bank, (uint16)eff);
+    if (off >= 0 && off + 1 < 0x20000) {
+        uint16 target = (uint16)cpu->ram[off] | ((uint16)cpu->ram[off + 1] << 8);
+        fprintf(stderr, "[indirlog]   -> WRAM, live table entry = $%04X "
+                "(would-be target $%02X:%04X)\n", target, bank, target);
+    } else if (is_hw_reg(bank, (uint16)eff)) {
+        /* Deliberately NOT read via ReadReg — this address was never
+         * touched by any real dispatch before now (the JSR itself is
+         * suppressed), so sampling it here would be a brand-new read
+         * side effect. Report the classification only. */
+        fprintf(stderr, "[indirlog]   -> SNES hardware-register space "
+                "($2000-$5FFF) — NOT a real static/WRAM table. A "
+                "\"JSR (abs,X)\" landing here is almost certainly a "
+                "decode artifact (wrong entry m/x desyncing operand "
+                "bytes), not a genuine unauthorised dispatch table.\n");
+    } else {
+        const uint8 *p = RomPtr(((uint32)bank << 16) | (uint16)eff);
+        uint16 target = (uint16)p[0] | ((uint16)p[1] << 8);
+        fprintf(stderr, "[indirlog]   -> ROM, static table entry = $%04X "
+                "(would-be target $%02X:%04X)\n", target, bank, target);
+    }
+}
+
 void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
     int off = cpu_ram_offset(bank, addr);
     if (off >= 0) {
         uint8 old = cpu->ram[off];
+        /* AR_WATCH0019=1 (2026-07-01, temporary probe): unconditional --
+         * fires on EVERY write to $0019, changed or not. AR_WATCHOBJ only
+         * logs on value CHANGE (old != v); if something writes 0xA1 to $19
+         * every frame and it's already 0xA1 (e.g. restored once from the
+         * SRAM save via a raw memcpy at boot, bypassing all per-byte write
+         * instrumentation, then rewritten identically every frame after),
+         * AR_WATCHOBJ would correctly stay silent forever after the first
+         * transition. This settles it either way. */
+        if (off == 0x19 && getenv("AR_WATCH0019")) {
+            static int n;
+            if (n++ < 200) {
+                extern int snes_frame_counter; extern const char *g_last_recomp_func;
+                extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                fprintf(stderr, "[watch0019] $0019=%02x (was %02x) f=%d cur=%s stk:",
+                        v, old, snes_frame_counter, g_last_recomp_func ? g_last_recomp_func : "?");
+                for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+                    fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                fprintf(stderr, "\n");
+            }
+        }
         /* AR_STACKPROV pusher-provenance: in emitted push code the byte is
          * written to cpu->S BEFORE S is decremented, so addr==cpu->S uniquely
          * marks a stack push. Stamp the current block-PC as this slot's pusher
@@ -319,9 +399,17 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
             if (wo >= 0 && off >= wo && off < wo + 0x40 && old != v) {
                 extern int snes_frame_counter; extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
                 extern const char *g_last_recomp_func;
+                extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
                 static int n;
                 if (n++ < 8000) {
-                    fprintf(stderr, "[wobj] $%04x=%02x (was %02x) f=%d PB=%02x cur=%s stk:", off, v, old, snes_frame_counter, cpu->PB, g_last_recomp_func ? g_last_recomp_func : "?");
+                    uint32_t last_blk = g_ar_blk_ring[(g_ar_blk_idx - 1u) & 1023u];
+                    int d14off = cpu_ram_offset(0x7E, (uint16)(cpu->D + 0x0014));
+                    int d16off = cpu_ram_offset(0x7E, (uint16)(cpu->D + 0x0016));
+                    uint16 d14 = (d14off >= 0) ? ((uint16)cpu->ram[d14off] | ((uint16)cpu->ram[d14off+1] << 8)) : 0xffff;
+                    uint16 d16 = (d16off >= 0) ? ((uint16)cpu->ram[d16off] | ((uint16)cpu->ram[d16off+1] << 8)) : 0xffff;
+                    fprintf(stderr, "[wobj] $%04x=%02x (was %02x) f=%d PB=%02x blkpc=$%06X X=$%04X DB=$%02X D14=$%04X D16=$%04X cur=%s stk:",
+                            off, v, old, snes_frame_counter, cpu->PB, last_blk, cpu->X, cpu->DB, d14, d16,
+                            g_last_recomp_func ? g_last_recomp_func : "?");
                     for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
                         fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
                     fprintf(stderr, "\n");
@@ -354,8 +442,39 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
     if (off >= 0 && off + 1 < 0x20000) {
         uint16 old = (uint16)cpu->ram[off]
                    | ((uint16)cpu->ram[off + 1] << 8);
+        /* AR_WATCH14=1 (2026-07-01, temporary probe): traces the actual STA
+         * $0014/$0016 write inside bank_01_ADAD (the position scratch pair
+         * that AR_WATCHOBJ found frozen at read-time despite varying per-
+         * object source data) -- is the WRITE itself already frozen (bug is
+         * upstream, e.g. the subtracted D:0094/D:0096 reference), or does
+         * something clobber it between write and read (shouldn't be
+         * possible per static read -- no calls in between -- but verify)? */
+        if ((off == 0x14 || off == 0x16) && getenv("AR_WATCH14")) {
+            extern int snes_frame_counter; extern const char *g_last_recomp_func;
+            static int n;
+            if (n++ < 4000)
+                fprintf(stderr, "[watch14] $%04x=%04x (was %04x) f=%d X=$%04X PB=%02x cur=%s\n",
+                        off, v, old, snes_frame_counter, cpu->X, cpu->PB,
+                        g_last_recomp_func ? g_last_recomp_func : "?");
+        }
         cpu->ram[off]     = (uint8)(v & 0xFF);
         cpu->ram[off + 1] = (uint8)(v >> 8);
+        /* AR_WATCH0019=1 (2026-07-01, temporary probe): see cpu_write8's
+         * copy of this block for why -- unconditional, catches a same-
+         * value rewrite AR_WATCHOBJ's on-change filter would hide. A
+         * 16-bit write at off==0x18 also touches 0x19 (the high byte). */
+        if ((off == 0x19 || off == 0x18) && getenv("AR_WATCH0019")) {
+            static int n;
+            if (n++ < 200) {
+                extern int snes_frame_counter; extern const char *g_last_recomp_func;
+                extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+                fprintf(stderr, "[watch0019-16] off=$%04x v=%04x (was %04x) f=%d cur=%s stk:",
+                        off, v, old, snes_frame_counter, g_last_recomp_func ? g_last_recomp_func : "?");
+                for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+                    fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+                fprintf(stderr, "\n");
+            }
+        }
         if (getenv("AR_WATCHOBJ")) {
             static long wo = -2;
             if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
@@ -532,6 +651,25 @@ static RecompReturn _cpu_dispatch_once(CpuState *cpu, uint32 pc24,
     source_pc24 &= 0xFFFFFFu;
     unsigned mx_idx = (unsigned)(((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1));
     int via_mirror = 0;
+    /* AR_F5BE_HANDLERS=1 (2026-07-02, temporary probe): the ActRaiser town
+     * per-frame handler dispatcher $03:F5BE calls out via a PHX/PHY/PHA/SEP/
+     * RTS trick whose real target/return-continuation set can't be reliably
+     * reconstructed by static ROM analysis (the per-town table layout at
+     * $03:F5ED doesn't match a simple fixed-stride array -- naive re-scan
+     * produces garbage). This is the generic dispatch trampoline every
+     * mismatched RTS funnels through, so logging here captures ground truth
+     * with zero engine/decode risk: every dispatch whose source is F5BE's
+     * exit RTS site ($03F5E2) IS a handler call; log its target + cpu->S +
+     * frame so the real handler set and per-town table shape can be read
+     * off directly instead of guessed. See DEBUG.md / SEAMS.md town-handler
+     * subsystem notes. */
+    if (getenv("AR_F5BE_HANDLERS") && (source_pc24 == 0x03F5E2u || source_pc24 == 0x03F5E3u)) {
+        extern int snes_frame_counter;
+        fprintf(stderr, "[f5be] src=%06X -> target=%06X S=%04X m=%u x=%u f=%d\n",
+                source_pc24, pc24, cpu->S, cpu->m_flag & 1, cpu->x_flag & 1,
+                snes_frame_counter);
+        fflush(stderr);
+    }
     RecompReturn (*fp)(CpuState *) = _cpu_dispatch_lookup(cpu, pc24);
     if (fp == NULL) {
         /* LoROM bank-mirror fallback: $00-$3F and $80-$BF share bytes.
@@ -556,6 +694,29 @@ static RecompReturn _cpu_dispatch_once(CpuState *cpu, uint32 pc24,
                 (unsigned)cpu->x_flag, cpu->S, snes_frame_counter);
         for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 10; i--)
             fprintf(stderr, "[b127]   [%d] %s\n", i, g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+    }
+    /* AR_B898LOG (2026-06-30): trace EVERY dispatch that resolves to $01:B898
+     * (mode-agnostic, hit-or-miss -- unlike AR_DISPMISSALL which is gated to
+     * action-stage misses only, neither of which fits our case: B898 is a
+     * REGISTERED function, so a dispatch to it is a HIT, and we're in sim
+     * mode). Names the source PC / call stack for the x=1 anomaly (933C's
+     * OWN direct call to B898 is proven clean via AR_CALLMX -- this must be a
+     * SEPARATE dispatch, most likely via cpu_dispatch_pc_from's flat-dispatch
+     * loop landing on B898's entry address from an unrelated miss elsewhere;
+     * this log names exactly which source RTS/dispatch produces it). */
+    if (pc24 == 0x01B898u && getenv("AR_B898LOG")) {
+        extern int snes_frame_counter; extern int g_recomp_stack_top;
+        extern const char *g_recomp_stack[];
+        static unsigned long n;
+        if (n++ < 4000) {
+            fprintf(stderr, "[b898log] ->%06x from %06x mx=%u (m=%u x=%u) found=%d "
+                    "via_mirror=%d S=%04x top=%d f=%d\n",
+                    pc24, source_pc24, mx_idx, (unsigned)cpu->m_flag,
+                    (unsigned)cpu->x_flag, fp != NULL, via_mirror, cpu->S,
+                    g_recomp_stack_top, snes_frame_counter);
+            for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 10; i--)
+                fprintf(stderr, "[b898log]   [%d] %s\n", i, g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+        }
     }
     /* AR_1EHIT: trace every $1E,X object-handler dispatch (source $8668 =
      * $8661/$8657's LDA $1E,X; PHA; RTS). The newly-registered $8657 yield
@@ -685,6 +846,56 @@ static RecompReturn _cpu_dispatch_once(CpuState *cpu, uint32 pc24,
                 }
                 /* continuation itself unregistered (shouldn't happen: $8966 is a
                  * cfg func) -- fall through to the generic unwind below. */
+            }
+        }
+        /* Generic RTS/RTL-follow (2026-07-02): a computed dispatch (PHA/RTS
+         * jump table) often lands on a bare RTS/RTL -- a "no-op handler"
+         * table entry, or a pushed continuation whose only job is to pop the
+         * next frame. E.g. ActRaiser's town dispatcher $03:86FD passes its
+         * continuation in A (#$8711), so every handler chain returns through
+         * the bare RTS at $03:8712, then another at $03:86FC -- none of which
+         * are function entries. Statically registering every 1-byte RTS hop
+         * is whack-a-mole (each town/state variant adds more); instead,
+         * emulate the RTS chain: pop the next return frame and retry the
+         * lookup. Flags are untouched (RTS/RTL don't affect m/x), so this is
+         * semantically exact. Mirrors the BRA/BRL follow above; hop-capped
+         * against garbage chains, and any pops are undone by the absolute
+         * S-restore in the generic unwind below if the chain still misses. */
+        {
+            int hops = 0;
+            uint32 fpc = pc24;
+            while (fp == NULL && hops < 8) {
+                uint8  tb = (uint8)((fpc >> 16) & 0xFF);
+                uint16 ta = (uint16)(fpc & 0xFFFF);
+                uint8  op = cpu_read8(cpu, tb, ta);
+                if (op == 0x60) {          /* RTS: pop 2, target+1 (same bank) */
+                    uint16 lo = cpu_read8(cpu, 0x00, (uint16)(cpu->S + 1));
+                    uint16 hi = cpu_read8(cpu, 0x00, (uint16)(cpu->S + 2));
+                    cpu->S = (uint16)(cpu->S + 2);
+                    fpc = ((uint32)tb << 16) |
+                          (uint16)((((hi << 8) | lo) + 1) & 0xFFFFu);
+                } else if (op == 0x6B) {   /* RTL: pop 3, target+1 (banked) */
+                    uint16 lo = cpu_read8(cpu, 0x00, (uint16)(cpu->S + 1));
+                    uint16 hi = cpu_read8(cpu, 0x00, (uint16)(cpu->S + 2));
+                    uint8  bk = cpu_read8(cpu, 0x00, (uint16)(cpu->S + 3));
+                    cpu->S = (uint16)(cpu->S + 3);
+                    fpc = ((uint32)bk << 16) |
+                          (uint16)((((hi << 8) | lo) + 1) & 0xFFFFu);
+                } else {
+                    break;
+                }
+                hops++;
+                fp = _cpu_dispatch_lookup(cpu, fpc);
+                if (fp == NULL) {
+                    uint8 fb = (uint8)((fpc >> 16) & 0xFF);
+                    if (fb < 0x40 || (fb >= 0x80 && fb < 0xC0))
+                        fp = _cpu_dispatch_lookup(cpu, fpc ^ 0x800000u);
+                }
+            }
+            if (fp != NULL) {
+                _dispatch_log_record(fpc, source_pc24, mx_idx, 1, 0);
+                cpu->host_return_valid = 0;
+                return fp(cpu);
             }
         }
         /* Not found: the popped (PB:PC) is a normal mid-caller return addr,

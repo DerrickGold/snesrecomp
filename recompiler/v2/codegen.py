@@ -322,6 +322,101 @@ def _nearest_survivor(survivors, m: int, x: int):
     return best
 
 
+# Per-target cfg-declared canonical (m, x) set, installed alongside
+# _VALID_VARIANTS by v2_regen (see set_canonical_variants). This is the
+# SPECIFIC width whose clean, emitted body is what PROVED a dirty sibling
+# variant was safe to prune (_compute_prunable in v2_regen.py: a dirty
+# variant is prunable only when a clean canonical sibling exists). Routing
+# a pruned variant's dispatch case to that proven-equivalent canonical is
+# sound; routing it to whichever OTHER survivor happens to be "nearest" by
+# the generic (m,x)-distance heuristic below is NOT — nothing proved that
+# survivor decodes the same bytes.
+#
+# 2026-06-30 bug (ActRaiser $01:B898): B898's body normalizes M early via
+# REP #$20 but never touches X. M1X0 was correctly pruned (M0X0, its clean
+# canonical sibling, decodes identically after the REP normalizes M) — but
+# _nearest_survivor's generic heuristic ("prefer matching m over matching
+# x") then routed the (m=1,x=0) dispatch case to M1X1 instead of M0X0,
+# because M1X1 matches m and M0X0 doesn't, even though M1X1 was NEVER
+# proven equivalent to M1X0 (X is never normalized, so M1X1's X-width-
+# sensitive decode genuinely differs from M1X0's). Every caller dispatching
+# with runtime (m=1,x=0) ran M1X1's body instead — entered with the wrong
+# assumed X width, misdecoding its own `LDX #imm` and cascading into
+# garbage execution. See [[actsim-crash-nlr-fix]] / [[misdecode-detection-toolkit]].
+_CANONICAL_VARIANTS: Dict[int, frozenset] = {}
+_PROVEN_EQUIVALENT: Dict[int, Dict[Tuple[int, int], frozenset]] = {}
+
+
+def set_canonical_variants(d) -> None:
+    """Install the per-target cfg-declared canonical (m, x) set from
+    v2_regen. Pass an empty dict to clear (=> _nearest_survivor falls back
+    to the generic distance heuristic everywhere, the pre-fix behaviour)."""
+    global _CANONICAL_VARIANTS
+    _CANONICAL_VARIANTS = d or {}
+
+
+def set_proven_equivalent(d) -> None:
+    """Install the per-target, per-(m,x) PROVEN-equivalent sibling map
+    from v2_regen (built from emit_function._find_equivalent_variants'
+    instruction-shape coverage check). Keyed by 24-bit addr -> {(m, x):
+    frozenset of sibling (sm, sx) proven equivalent}. Pass an empty dict
+    to clear.
+
+    Unlike `_CANONICAL_VARIANTS` (a cfg-declared or (1,1)-defaulted
+    ASSUMPTION about which width is "the" canonical), this is a per-
+    PRUNED-VARIANT fact: literally, which surviving widths this specific
+    (m, x) was shown to decode identically to, PC-for-PC. Take priority
+    over the canonical/default guesses in _route_pruned_variant — see
+    that function's docstring for why the guesses can be wrong (the
+    2026-07-01 $01:B898 second-round bug: no cfg entry existed, so the
+    (1, 1) default was used, but the real dominant runtime width was
+    (0, 0))."""
+    global _PROVEN_EQUIVALENT
+    _PROVEN_EQUIVALENT = d or {}
+
+
+def _route_pruned_variant(addr_24: int, survivors, m: int, x: int):
+    """Pick which surviving variant a PRUNED (addr_24, m, x) dispatch case
+    should call.
+
+    Preference order:
+      1. A survivor PROVEN equivalent to (m, x) via instruction-shape
+         coverage (`_PROVEN_EQUIVALENT` / set_proven_equivalent) — a hard
+         fact, not a guess.
+      2. The cfg-declared canonical sibling that justified the prune
+         (`_CANONICAL_VARIANTS`) — an assumption, but a hand-verified one.
+      3. The implicit (1, 1) SNES-reset default for auto-promoted targets
+         with no cfg entry.
+      4. The generic nearest-by-(m,x)-distance heuristic, as a last
+         resort when nothing above matches a live survivor.
+
+    2026-06-30: an auto-promoted target with no cfg `func` entry has NO key
+    in `_CANONICAL_VARIANTS` at all (set_canonical_variants only ever
+    receives cfg-declared entries) — v2_regen._compute_prunable's own
+    default for that case is the implicit (1, 1) SNES-reset width
+    (`canon = canonical_variants.get(addr) or {(1, 1)}`), which is what
+    actually proved THOSE prunes safe. Falling through to the distance
+    heuristic here for that class would silently reopen the exact bug this
+    routing fix exists for, just for auto-discovered instead of
+    cfg-declared targets. Mirror the same (1, 1) default.
+
+    2026-07-01: that (1, 1) default is itself just an assumption and can be
+    wrong (ground truth showed a real function whose dominant runtime
+    width was (0, 0), not (1, 1)) — hence tier 1 above, which is a proof
+    rather than a guess and is checked first."""
+    proven = _PROVEN_EQUIVALENT.get(addr_24 & 0xFFFFFF, {}).get((m & 1, x & 1))
+    if proven:
+        for c in proven:
+            if c in survivors:
+                return c
+    canon = _CANONICAL_VARIANTS.get(addr_24 & 0xFFFFFF) or {(1, 1)}
+    if canon:
+        for c in canon:
+            if c in survivors:
+                return c
+    return _nearest_survivor(survivors, m, x)
+
+
 def variant_dispatch_case_lines(addr_24: int, base_name: str,
                                 indent: str = "    ", pre_call=None):
     """Emit the case/default body for a runtime (m, x) dispatch switch.
@@ -367,7 +462,7 @@ def variant_dispatch_case_lines(addr_24: int, base_name: str,
         if (m, x) in survivor_set:
             emit(f"case {idx}", f"{base_name}{_variant_suffix(m, x)}")
         elif survivors:
-            sm, sx = _nearest_survivor(survivors, m, x)
+            sm, sx = _route_pruned_variant(addr_24, survivors, m, x)
             emit(f"case {idx}", f"{base_name}{_variant_suffix(sm, sx)}",
                  f"  /* M{m}X{x} pruned -> nearest survivor M{sm}X{sx} */")
     if survivors:
@@ -1340,7 +1435,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     bank = (insn.addr >> 16) & 0xFF
     entries = insn.dispatch_entries
     idx_reg = getattr(insn, 'dispatch_idx_reg', 'X')
-    if idx_reg not in ('X', 'Y'):
+    if idx_reg not in ('X', 'Y', 'A'):
         idx_reg = 'X'
     n = len(entries)
     site_pc24 = insn.addr & 0xFFFFFF
@@ -1370,11 +1465,16 @@ def _emit_indirect_dispatch(insn) -> List[str]:
     # at the dispatch site. The PHA/SEP/RTS idiom is the exception: it
     # explicitly forces M/X to 8-bit before the synthetic RTS transfer.
     is_rts_stack_dispatch = bool(getattr(insn, 'dispatch_terminal', False))
+    # cfg `sep:<mask>` — real code executes SEP #<mask> between the PHA and
+    # the dispatching RTS; handlers and the ret continuation run at the
+    # SEP'd state. Mirror the decoder's succ_m/succ_x so the emitted
+    # `goto L_<ret>` suffix matches the label the decoder created.
+    _sep_mask = int(getattr(insn, 'dispatch_sep', 0) or 0)
     if is_rts_stack_dispatch:
         em, ex = 1, 1
     else:
-        em = getattr(insn, 'm_flag', 1) & 1
-        ex = getattr(insn, 'x_flag', 1) & 1
+        em = 1 if (_sep_mask & 0x20) else (getattr(insn, 'm_flag', 1) & 1)
+        ex = 1 if (_sep_mask & 0x10) else (getattr(insn, 'x_flag', 1) & 1)
     suffix = _variant_suffix(em, ex)
 
     # Comment marker differentiates JSR (call, fall-through) from
@@ -1501,6 +1601,98 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         else:
             lines.append(
                 f"  return cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _target);")
+        lines.append("}")
+        return lines
+    if idx_reg == 'A':
+        # Value-keyed PHA/RTS dispatch (cfg `idx:A`): the PHA'd A value IS
+        # the handler address minus 1 (classic RTS jump-table encoding),
+        # loaded via indirection the index-keyed form can't express — e.g.
+        # ActRaiser $03:F5BE's per-town two-level table walk (outer table
+        # $03:F5ED[town] -> inner $FFFF-terminated handler list walked with
+        # X as an absolute ROM pointer). Switching on A against the raw
+        # table words is correct regardless of how the value was loaded.
+        # Decoder stored entries as word+1 (the RTS-landing PC), so each
+        # case matches (target - 1).
+        if _sep_mask:
+            # Real code executes SEP #<mask> between the PHA and the RTS;
+            # both are replaced by this switch, so apply the SEP here. The
+            # runtime (m,x) then select the handlers' SEP'd variants below.
+            lines.append(f"  {{ /* SEP #${_sep_mask:02X} (sat between PHA and "
+                         f"dispatching RTS in the original code) */")
+            for stmt in emitter_helpers.modify_p_via_mirrors(_sep_mask, "sep"):
+                lines.append(f"    {stmt}")
+            lines.append("  }")
+        lines.append("  uint16 _val = (uint16)(cpu->A & 0xFFFF);"
+                     "  /* PHA'd handler-1 value */")
+        lines.append("  switch (_val) {")
+        _seen_vals = set()
+        for e in entries:
+            if e is None or e == 0:
+                continue  # table terminator / padding (nulled by decoder)
+            target_bank = (e >> 16) & 0xFF
+            local_pc = e & 0xFFFF
+            tgt_addr = e & 0xFFFFFF
+            case_value = (local_pc - 1) & 0xFFFF  # the raw table word
+            if case_value in _seen_vals:
+                continue
+            _seen_vals.add(case_value)
+            base_name = _NAME_RESOLVER.get(tgt_addr)
+            if base_name is None:
+                base_name = f"bank_{target_bank:02X}_{local_pc:04X}"
+            lines.append(f"    case 0x{case_value:04x}: {{  /* -> {base_name} */")
+            for em_v, ex_v in valid_variant_list(tgt_addr):
+                _UNRESOLVED_CALL_TARGETS.add((tgt_addr, em_v, ex_v))
+            lines.append("      uint8 _saved_pb = cpu->PB;")
+            lines.append(
+                f"      cpu_trace_pb_change(cpu, 0, _saved_pb,"
+                f" {target_bank:#04x}, CPU_TR_JSL);")
+            lines.append(f"      cpu->PB = {target_bank:#04x};")
+            lines.append("      RecompReturn _r;")
+            lines.append(
+                "      switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {")
+            _pre = (["cpu_tailcall_inherit_return_context(_entry_s, _hrv);"]
+                    if not is_jsr_like else None)
+            lines += variant_dispatch_case_lines(
+                tgt_addr, base_name, indent="        ", pre_call=_pre)
+            lines.append("      }")
+            lines.append(
+                "      cpu_trace_pb_change(cpu, 0, cpu->PB, _saved_pb, CPU_TR_RTL);")
+            lines.append("      cpu->PB = _saved_pb;")
+            lines.append("      if (_r != RECOMP_RETURN_NORMAL) {")
+            lines.append(
+                "        cpu_trace_event(cpu, 0, CPU_TR_NLR_PROPAGATE, (uint8)_r, 0);")
+            lines.append(
+                "        cpu_trace_mark_nlr_exit(BD_EXIT_KIND_SKIP_PROPAGATION);")
+            lines.append("        return (_r == RECOMP_RETURN_TAILCALL ? _r : (RecompReturn)((int)_r - 1));")
+            lines.append("      }")
+            if is_jsr_like:
+                lines.append("      break;")
+            else:
+                lines.append("      return RECOMP_RETURN_NORMAL;")
+            lines.append("    }")
+        # Unknown value: an un-enumerated table entry reached at runtime
+        # (cfg window undercounts the real table). Log it; for the call
+        # form also undo the pre-pushed PHY frame so the compound
+        # PHY/PHA/SEP/RTS op stays stack-neutral (the handler that would
+        # have popped it never runs) — same defense as the idx-form OOB.
+        lines.append("    default:")
+        lines.append(
+            f"      (void)cpu_trace_dispatch_oob(cpu, 0x{site_pc24:06x}, _val);")
+        if is_call_ret:
+            _phy_bytes_a = 1 if getattr(insn, 'x_flag', 0) else 2
+            lines.append(
+                f"      cpu->S = (uint16)(cpu->S + {_phy_bytes_a}u);  "
+                f"/* undo is_call_ret's pre-pushed PHY frame (unknown value) */")
+            lines.append("      break;")
+        elif is_jsr:
+            lines.append("      break;")
+        else:
+            lines.append("      return RECOMP_RETURN_NORMAL;")
+        lines.append("  }")
+        if is_call_ret:
+            lines.append(f"  goto L_{_ret16 & 0xFFFF:04X}{suffix};")
+        elif is_jsr:
+            lines.append("  /* fall through to post-JSR block */")
         lines.append("}")
         return lines
     if len(table_bases) >= 2:
@@ -1792,7 +1984,10 @@ def _emit_call(op: Call) -> List[str]:
         # suppressed phantom rather than a missing-dispatch priority.
         # Authorised JSR (abs,X) emit comes later (separate priority).
         if op.source_pc24 is not None and op.table_base is not None:
+            bank = (op.source_pc24 >> 16) & 0xFF
             return [
+                f"  ar_indirect_suppressed_log(cpu, 0x{op.source_pc24:06x}u, "
+                f"0x{bank:02x}u, 0x{op.table_base & 0xFFFF:04x}u, cpu->X);",
                 f"/* Call indirect SUPPRESSED: JSR (${op.table_base:04X},X) at "
                 f"${op.source_pc24:06X} — cfg-required-dispatch-or-kill, "
                 f"no indirect_call_table authorisation */"

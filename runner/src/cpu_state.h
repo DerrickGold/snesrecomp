@@ -23,6 +23,8 @@
  */
 
 #include "types.h"
+#include <stdio.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -207,14 +209,54 @@ static inline uint16 cpu_read_a_m(const CpuState *cpu) {
     return cpu->m_flag ? (uint16)cpu_read_a8(cpu) : cpu_read_a16(cpu);
 }
 
+/* AR_TRACEA=1 (2026-07-01, temporary probe): every cpu_write_a8/a16 call,
+ * unconditional. Settles whether the $0019-read-then-write sequence at
+ * bank00 $008106 really produces A's low byte == the value read (the C
+ * source says it must; observed behavior says A ends up 0x00A1 instead
+ * of the read value). If this shows the write DOES set A correctly and
+ * something ELSE changes it before the next log point, that narrows the
+ * corruption to between here and there; if the write itself never
+ * receives the expected value, the read observed by AR_READ0019 isn't
+ * actually what feeds this call. */
+static inline void ar_trace_a_write(uint16 old_a, uint8 v_low, int is16, uint16 new_a) {
+    extern int snes_frame_counter; extern const char *g_last_recomp_func;
+    /* Gated by AR_TRACEA_GF=<game-frame> (default 600) -- A gets written
+     * constantly across the whole game; an unconditional cap would
+     * exhaust in the first fraction of a second, long before reaching
+     * sim mode. NOT gated by g_last_recomp_func: the read immediately
+     * preceding the corruption showed cur=(none), so a function-name
+     * filter would risk skipping exactly the write we need to see. */
+    extern uint8 g_ram[0x20000];
+    static long min_gf = -2;
+    if (min_gf == -2) { const char *e = getenv("AR_TRACEA_GF");
+        min_gf = e ? atol(e) : 600; }
+    unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+    if ((long)gf < min_gf) return;
+    static int n;
+    if (n++ < 3000) {
+        fprintf(stderr, "[tracea] %s A %04x -> %04x (v=%s%02x) f=%d cur=%s\n",
+                is16 ? "write16" : "write8", old_a, new_a,
+                is16 ? "" : "0x", v_low, snes_frame_counter,
+                g_last_recomp_func ? g_last_recomp_func : "?");
+    }
+}
+
 /* 8-bit A write — preserve high byte (= B). 65816 hw contract: in M=1
  * mode, ops on A leave the high half untouched (XBA / TDC observe the
  * preserved value). Distinct from cpu_write_x8 which ZEROS the high. */
 static inline void cpu_write_a8(CpuState *cpu, uint8 v) {
+    uint16 old_a = cpu->A;
     cpu->A = (uint16)((cpu->A & 0xFF00) | (uint16)v);
+    static int en = -1;
+    if (en < 0) en = getenv("AR_TRACEA") != NULL;
+    if (en) ar_trace_a_write(old_a, v, 0, cpu->A);
 }
 static inline void cpu_write_a16(CpuState *cpu, uint16 v) {
+    uint16 old_a = cpu->A;
     cpu->A = v;
+    static int en = -1;
+    if (en < 0) en = getenv("AR_TRACEA") != NULL;
+    if (en) ar_trace_a_write(old_a, (uint8)(v & 0xFF), 1, cpu->A);
 }
 /* M-flag-driven write. 8-bit semantics in m=1 (preserve high), full
  * 16-bit in m=0. Caller passes a 16-bit value; we mask in m=1. */
@@ -436,6 +478,7 @@ void ar_mxhist_record(uint32 pc24, int m, int x);
 void ar_mxhist_dump(void);
 void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32 pc24);
 void ar_garbage_variant_trap(CpuState *cpu, const char *fn, uint32 pc24);
+void ar_adad_trace(CpuState *cpu, const char *fn, uint32 pc24);
 static inline void ar_entry_mx_check(CpuState *cpu, int em, int ex,
                                      const char *fn, uint32 pc24) {
   if (g_ar_mx_check
@@ -445,6 +488,7 @@ static inline void ar_entry_mx_check(CpuState *cpu, int em, int ex,
     ar_mxhist_record(pc24, cpu->m_flag & 1, cpu->x_flag & 1);
   if (g_ar_trapfn)
     ar_entry_trapfn(cpu, fn, pc24);
+  ar_adad_trace(cpu, fn, pc24);
 }
 
 /* ── Exit-side invariant checks (symmetric twins of ar_entry_mx_check) ──
@@ -498,6 +542,24 @@ static inline void ar_call_mx_check(CpuState *cpu, int em, int ex,
       && (((cpu->m_flag & 1) != em) || ((cpu->x_flag & 1) != ex)))
     ar_call_mx_fail(cpu, em, ex, fn, pc24);
 }
+
+/* AR_INDIRLOG (2026-07-01): every `JSR (abs,X)` the decoder severed for
+ * lack of cfg `indirect_call_table` authorisation calls this right where
+ * the real dispatch would have happened. Names the site, table base, and
+ * runtime (m,x,X-reg) so we can tell a genuine unauthorised static-ROM
+ * table (worth an `indirect_call_table` cfg line) apart from a table
+ * base that lands below $8000 (SNES hardware-register space under this
+ * bank's LoROM mapping, per cpu_state.c's address-routing comment) --
+ * which would mean the "JSR (abs,X)" itself is a decode artifact (wrong
+ * entry m/x desyncing operand bytes into something that merely LOOKS
+ * like a real instruction), the same failure class as the $01:B898 fix.
+ * Gated + capped so it's opt-in and bounded; NOT for permanent use — it
+ * performs a real read at the computed effective address for inspection,
+ * which is a new side effect at a site that was previously never
+ * executed at all (a concern only if that address is a read-sensitive
+ * hardware register). */
+void ar_indirect_suppressed_log(CpuState *cpu, uint32 site_pc24,
+                                 uint8 bank, uint16 table_base, uint16 x_reg);
 
 /* ── PEI-trampoline dispatch (2026-05-24, narrow detector) ─────────────
  *

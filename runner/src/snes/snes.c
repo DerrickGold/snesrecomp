@@ -593,6 +593,37 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
   return cart_read(snes->cart, bank, adr);
 }
 
+/* AR_WATCHOBJ/AR_WATCH0019 for DMA-driven writes (2026-07-01). dma.c's
+ * dma_transferByte -> snes_write writes STRAIGHT into snes->ram (which
+ * IS g_ram -- see snes_init(g_ram) in common_cpu_infra.c) with zero
+ * instrumentation, bypassing cpu_write8/cpu_write16/IndirWriteByte/
+ * IndirWriteWord entirely. Found chasing a sim-mode freeze: $0019 read
+ * 0xA1 mid-frame with NO write ever logged by any of those four
+ * instrumented paths -- DMA is the only write mechanism left that
+ * writes WRAM without going through them. Mirrors cpu_write8's watch
+ * bodies (unconditional for AR_WATCH0019, on-change for AR_WATCHOBJ). */
+static inline void snes_write_watch(uint32_t off, uint8_t old_val, uint8_t val) {
+  if (off == 0x19 && getenv("AR_WATCH0019")) {
+    static int n;
+    if (n++ < 200) {
+      extern int snes_frame_counter; extern const char *g_last_recomp_func;
+      fprintf(stderr, "[watch0019-dma] $0019=%02x (was %02x) f=%d cur=%s\n",
+              val, old_val, snes_frame_counter,
+              g_last_recomp_func ? g_last_recomp_func : "?");
+    }
+  }
+  if (getenv("AR_WATCHOBJ")) {
+    static long wo = -2;
+    if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
+    if (wo >= 0 && off >= (uint32_t)wo && off < (uint32_t)wo + 0x40 && old_val != val) {
+      extern int snes_frame_counter; extern const char *g_last_recomp_func;
+      fprintf(stderr, "[wobj-dma] $%04x=%02x (was %02x) f=%d cur=%s\n",
+              off, val, old_val, snes_frame_counter,
+              g_last_recomp_func ? g_last_recomp_func : "?");
+    }
+  }
+}
+
 void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
   uint8_t bank = adr >> 16;
   adr &= 0xffff;
@@ -604,7 +635,9 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
       snes->ram[addr] = val;
       debug_on_wram_write_byte(addr, old, val); }
 #else
-    snes->ram[addr] = val; // ram
+    { uint8_t old = snes->ram[addr];
+      snes->ram[addr] = val; // ram
+      snes_write_watch(addr, old, val); }
 #endif
   }
   if(bank < 0x40 || (bank >= 0x80 && bank < 0xc0)) {
@@ -615,7 +648,9 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
         snes->ram[adr] = val;
         debug_on_wram_write_byte((uint32_t)adr, old, val); }
 #else
-      snes->ram[adr] = val; // ram mirror
+      { uint8_t old = snes->ram[adr];
+        snes->ram[adr] = val; // ram mirror
+        snes_write_watch(adr, old, val); }
 #endif
     }
     if(adr >= 0x2100 && adr < 0x2200) {

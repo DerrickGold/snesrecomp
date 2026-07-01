@@ -158,23 +158,100 @@ static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
     return &g_ram[a & 0x1ffff];
   return RomPtr(a);
 }
+/* AR_WATCHOBJ/AR_WATCH16 gap fix (2026-07-01): cpu_write8/cpu_write16
+ * (cpu_state.c) are the only writers those two watches ever saw -- any
+ * store through an indexed/indirect addressing mode (`STA (dp),Y`, `STA
+ * [dp],Y`, `STA abs,X` when the effective address happens to land in a
+ * watched range) goes through IndirWriteByte/IndirWriteWord instead,
+ * which wrote straight to g_ram with zero instrumentation outside the
+ * (normally-off) SNESRECOMP_REVERSE_DEBUG trace build. That left a real
+ * blind spot: a value that's only ever written indirectly is invisible
+ * to both watches no matter what you set them to. Found chasing a
+ * sim-mode freeze where AR_WATCHOBJ=0 caught nothing on $0019 despite
+ * AR_SIMTRACE proving it holds a stray 0xA1 every frame -- the write
+ * had to be indirect. Mirrors cpu_write8's exact watch bodies so the
+ * two watches behave identically regardless of which store form hits
+ * the target address. */
+static inline void IndirWatchByte(uint8_t *dst, uint8_t old_val, uint8_t value) {
+  if (dst < g_ram || dst >= g_ram + 0x20000) return;
+  uint32_t off = (uint32_t)(dst - g_ram);
+  if (getenv("AR_WATCHOBJ")) {
+    static long wo = -2;
+    if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
+    if (wo >= 0 && off >= (uint32_t)wo && off < (uint32_t)wo + 0x40 && old_val != value) {
+      extern int snes_frame_counter; extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+      extern const char *g_last_recomp_func;
+      static int n;
+      if (n++ < 8000) {
+        fprintf(stderr, "[wobj-ind] $%04x=%02x (was %02x) f=%d cur=%s stk:",
+                off, value, old_val, snes_frame_counter,
+                g_last_recomp_func ? g_last_recomp_func : "?");
+        for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+          fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+        fprintf(stderr, "\n");
+      }
+    }
+  }
+}
+
 static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
+  uint8_t old_val = 0;
+  static int need_old = -1;
+  if (need_old < 0) need_old = getenv("AR_WATCHOBJ") != NULL;
+  if (need_old && dst >= g_ram && dst < g_ram + 0x20000) old_val = dst[0];
 #if SNESRECOMP_REVERSE_DEBUG
   // Only fire the WRAM hook if the write actually landed in WRAM.
   // dst may point into ROM for in-ROM data-table writes (a NOP in practice
   // since ROM is read-only, but the ptr math still lands there).
   // Read old BEFORE the store so the Tier-1 log can emit old/new.
   if (dst >= g_ram && dst < g_ram + 0x20000) {
-    uint8_t old_val = dst[0];
+    uint8_t old_val_dbg = dst[0];
     dst[0] = value;
-    debug_on_wram_write_byte((uint32_t)(dst - g_ram), old_val, value);
+    debug_on_wram_write_byte((uint32_t)(dst - g_ram), old_val_dbg, value);
   } else {
     dst[0] = value;
   }
 #else
   dst[0] = value;
 #endif
+  if (need_old) IndirWatchByte(dst, old_val, value);
+}
+
+static inline void IndirWatchWord(uint8_t *dst, uint16_t old_val, uint16_t value) {
+  if (dst < g_ram || dst >= g_ram + 0x20000) return;
+  uint32_t off = (uint32_t)(dst - g_ram);
+  if (getenv("AR_WATCHOBJ")) {
+    static long wo = -2;
+    if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
+    if (wo >= 0 && off >= (uint32_t)wo && off < (uint32_t)wo + 0x40 && old_val != value) {
+      extern int snes_frame_counter; extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+      extern const char *g_last_recomp_func;
+      static int n;
+      if (n++ < 8000) {
+        fprintf(stderr, "[wobj-ind] $%04x=%04x (was %04x) f=%d cur=%s stk:",
+                off, value, old_val, snes_frame_counter,
+                g_last_recomp_func ? g_last_recomp_func : "?");
+        for (int i = g_recomp_stack_top - 1; i >= 0 && i >= g_recomp_stack_top - 6; i--)
+          fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+        fprintf(stderr, "\n");
+      }
+    }
+  }
+  if (getenv("AR_WATCH16")) {
+    static int wv = -2;
+    if (wv == -2) { const char *e = getenv("AR_WATCH16"); wv = e ? (int)strtoul(e, NULL, 16) : -1; }
+    if (wv >= 0 && value == (uint16_t)wv) {
+      extern int snes_frame_counter; extern const char *g_recomp_stack[]; extern int g_recomp_stack_top;
+      extern const char *g_last_recomp_func;
+      int top = g_recomp_stack_top;
+      fprintf(stderr, "[watch16-ind] v=%04x -> off=%05x by=%s f=%d stack:",
+              value, off, g_last_recomp_func ? g_last_recomp_func : "?", snes_frame_counter);
+      for (int i = top - 1; i >= 0 && i >= top - 8; i--)
+        fprintf(stderr, " %s", g_recomp_stack[i] ? g_recomp_stack[i] : "?");
+      fprintf(stderr, "\n");
+    }
+  }
 }
 
 // 16-bit word store through a 24-bit DP pointer. Native counterpart of
@@ -183,12 +260,18 @@ static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
 // always contiguous in the target region (WRAM or ROM-mirror).
 static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
+  uint16_t old_val = 0;
+  static int need_old = -1;
+  if (need_old < 0)
+    need_old = (getenv("AR_WATCHOBJ") != NULL) || (getenv("AR_WATCH16") != NULL);
+  if (need_old && dst >= g_ram && dst < g_ram + 0x20000)
+    old_val = (uint16_t)dst[0] | ((uint16_t)dst[1] << 8);
 #if SNESRECOMP_REVERSE_DEBUG
   if (dst >= g_ram && dst < g_ram + 0x20000) {
-    uint16_t old_val = (uint16_t)dst[0] | ((uint16_t)dst[1] << 8);
+    uint16_t old_val_dbg = (uint16_t)dst[0] | ((uint16_t)dst[1] << 8);
     dst[0] = (uint8_t)value;
     dst[1] = (uint8_t)(value >> 8);
-    debug_on_wram_write_word((uint32_t)(dst - g_ram), old_val, value);
+    debug_on_wram_write_word((uint32_t)(dst - g_ram), old_val_dbg, value);
   } else {
     dst[0] = (uint8_t)value;
     dst[1] = (uint8_t)(value >> 8);
@@ -197,6 +280,7 @@ static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
   dst[0] = (uint8_t)value;
   dst[1] = (uint8_t)(value >> 8);
 #endif
+  if (need_old) IndirWatchWord(dst, old_val, value);
 }
 
 // Tier-1 wrappers for the direct IndirPtrDB([0] = val) pattern the generator

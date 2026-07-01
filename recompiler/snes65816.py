@@ -48,7 +48,7 @@ class Insn:
     __slots__ = ('addr', 'opcode', 'mnem', 'mode', 'operand', 'length',
                  'dispatch_entries', 'dispatch_kind', 'dispatch_idx_reg',
                  'dispatch_table_bases', 'm_flag', 'x_flag', 'dispatch_terminal',
-                 'dispatch_ret',
+                 'dispatch_ret', 'dispatch_sep',
                  'const_z_fold_unconditional', 'const_z_fold_dead_pc24')
 
     def __init__(self, addr, opcode, mnem, mode, operand, length):
@@ -73,6 +73,12 @@ class Insn:
         # before the handler addr): the in-function 16-bit continuation the
         # handlers RTS back to. None = terminal tail-call (default).
         self.dispatch_ret = None
+        # `sep:<mask>` from cfg indirect_dispatch: the real code executes
+        # SEP #<mask> between the PHA and the dispatching RTS (both replaced
+        # by the emitted switch). The emitter applies the SEP before the
+        # switch; the decoder decodes handlers/continuation at the SEP'd
+        # (m, x). 0 = no SEP (default, e.g. $01:B8C0's plain PHA;RTS).
+        self.dispatch_sep = 0
         self.m_flag = 1
         self.x_flag = 1
         # Constant-Z branch fold: when set on a BEQ/BNE, the preceding

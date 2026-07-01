@@ -38,6 +38,8 @@ from v2.codegen import (  # noqa: E402
     set_rom_size,
     set_force_variant_at,
     set_valid_variants,
+    set_canonical_variants,
+    set_proven_equivalent,
     set_trampoline_returns,
     take_rejected_call_targets,
     take_trampoline_returns,
@@ -117,6 +119,24 @@ _STUB_MARKERS = (
     'unresolved IndirectGoto',               # emit_function indirect JMP/JML with no resolution (2026-05-29)
 )
 
+# Dirty-eligibility-only markers (2026-07-01): these feed
+# `_scan_dirty_variants`' prune-eligibility scan but are deliberately
+# NOT in `_STUB_MARKERS` / not scanned by `_lint_stubs`. A variant the
+# narrow BRK-splitting garbage-variant detector flags
+# (`ar_garbage_variant_trap`, emitted by emit_function.py's
+# `_detect_garbage_variant`) is a proven wrong-width decode -- it
+# should count as "dirty" so the emit-truth prune can drop it when a
+# clean canonical sibling exists. But unlike the _STUB_MARKERS class,
+# a garbage variant that ISN'T prunable (no clean sibling, e.g. a
+# genuine RAM/computed-dispatch site) is expected to survive as loud
+# runtime-trap residue rather than fail the build -- that's the
+# existing, intentional fallback for unprunable dirty variants. Mixing
+# this into _STUB_MARKERS would make _lint_stubs treat that residue as
+# a hard build failure, which is not the goal here.
+_DIRTY_ONLY_MARKERS = (
+    'ar_garbage_variant_trap',               # emit_function._detect_garbage_variant
+)
+
 
 def _lint_stubs(out_dir: pathlib.Path) -> list[tuple[str, int, str, str]]:
     """Scan the .c files THIS regen writes for stub markers.
@@ -191,7 +211,7 @@ def _scan_dirty_variants(results, parsed) -> tuple:
                 continue
             if cur is None:
                 continue
-            for mk in _STUB_MARKERS:
+            for mk in _STUB_MARKERS + _DIRTY_ONLY_MARKERS:
                 if mk in line:
                     dirty.add(cur)
                     break
@@ -653,6 +673,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
     set_name_resolver(args_dict['name_map'])
     set_force_variant_at(args_dict['force_variant_at'])
     set_valid_variants(args_dict.get('valid_variants') or {})
+    set_proven_equivalent(args_dict.get('proven_equivalent') or {})
     set_trampoline_returns(args_dict['trampoline_returns'])
 
     bank = args_dict['bank']
@@ -670,6 +691,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
     bank_const_z_folds: list = []
     bank_dispatch_suppressed: list = []
     bank_unresolved_indirects: list = []
+    bank_equivalences: list = []
 
     try:
         src = emit_bank(rom, bank=bank, entries=cfg.entries,
@@ -683,6 +705,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
                             bank_dispatch_suppressed,
                         unresolved_indirect_collector=
                             bank_unresolved_indirects,
+                        equivalence_collector=bank_equivalences,
                         data_regions=cfg.data_regions or None,
                         exclude_ranges=cfg.exclude_ranges or None,
                         callee_exit_mx=args_dict['callee_exit_mx'],
@@ -711,6 +734,7 @@ def _emit_bank_one(args_dict: dict) -> dict:
         'const_z_folds': bank_const_z_folds,
         'dispatch_suppressed': bank_dispatch_suppressed,
         'unresolved_indirects': bank_unresolved_indirects,
+        'equivalences': bank_equivalences,
         'unresolved_calls': take_unresolved_call_targets(),
         'rejected_call_targets': take_rejected_call_targets(),
         'trampoline_returns_local': take_trampoline_returns(),
@@ -1323,6 +1347,15 @@ def main() -> int:
             addr = (bank << 16) | (entry.start & 0xFFFF)
             canonical_variants.setdefault(addr, set()).add(
                 (entry.entry_m & 1, entry.entry_x & 1))
+    # Install for codegen's pruned-variant-dispatch routing (2026-06-30):
+    # when a dirty sibling is pruned, route its dispatch case to the
+    # SPECIFIC canonical variant that proved the prune safe, not to
+    # whichever survivor a generic (m,x)-distance heuristic picks (which
+    # may never have been proven equivalent -- see codegen.py
+    # _route_pruned_variant / set_canonical_variants docstrings, and the
+    # ActRaiser $01:B898 M1X0->M1X1 misroute this fixes).
+    set_canonical_variants(
+        {a: frozenset(s) for a, s in canonical_variants.items()})
 
     # Apply per-(m,x) variants to existing cfg entries: for each cfg
     # entry whose target address has more than its declared (m, x)
@@ -1521,9 +1554,18 @@ def main() -> int:
     # canonical sibling). Both grow monotonically -> the prune
     # converges alongside auto-promote.
     valid_variants_map: dict = {}
+    proven_equivalent_map: dict = {}
     cumulative_dirty_variants: set = set()
     cumulative_emitted_variants: set = set()
     cumulative_pruned: set = set()
+    # Proven-equivalence facts (2026-07-01): (addr24, this_m, this_x,
+    # sibling_m, sibling_x) records from _find_equivalent_variants,
+    # unioned across passes exactly like the other per-pass drains
+    # above. Rebuilt into a routing map and pushed to codegen after
+    # every pass so _route_pruned_variant can prefer a PROVEN
+    # substitute over the cfg-canonical / (1,1)-default / nearest-
+    # distance fallbacks. See codegen.py set_proven_equivalent.
+    cumulative_equivalences: set = set()
     # In-cfg-set banks: the reference-taint prune only treats a missing
     # callee variant as a dangling reference when its bank is in the cfg
     # set (out-of-set targets get loud stub bodies, never dangle).
@@ -1562,6 +1604,27 @@ def main() -> int:
 
     for pass_idx in range(max_passes):
         _phase(f"emit_pass_{pass_idx}")
+        # Fixpoint bug fix (2026-07-01): equivalence facts discovered
+        # DURING this pass's emit_bank calls (via _find_equivalent_variants)
+        # only take effect for dispatch-switch emission in the NEXT pass
+        # (proven_equivalent_map for THIS pass's work_items was built from
+        # cumulative_equivalences as of the END of the PREVIOUS pass). If
+        # this happens to be the pass that satisfies every other
+        # convergence condition (added==0, no newly_pruned, no
+        # variant_added, no reference-taint prunes), the loop would break
+        # immediately -- writing results to disk that reflect stale
+        # routing for whatever got proven equivalent JUST NOW, even though
+        # the end-of-run report (built from the fully-accumulated
+        # cumulative_equivalences) correctly shows the fix. Concretely:
+        # bank_00_8465's dispatch switch kept routing to the old "nearest
+        # survivor" M1X1 guess instead of the newly-proven M0X1, because
+        # the pass that discovered the M0X1 proof was also the pass that
+        # converged and stopped. Snapshotting the count here and comparing
+        # after the pass lets the convergence check force one more
+        # re-emission whenever equivalences grew, so the LAST written
+        # pass is guaranteed to have used the FULL final proven_equivalent
+        # map, not the second-to-last snapshot of it.
+        equiv_count_before_pass = len(cumulative_equivalences)
         # Clear any leftovers from prior session/process.
         take_unresolved_call_targets()
         # take_unresolved_goto_targets() retired 2026-05-02 — goto
@@ -1644,6 +1707,7 @@ def main() -> int:
                 'name_map': name_map,
                 'force_variant_at': force_variant_map,
                 'valid_variants': valid_variants_map,
+                'proven_equivalent': proven_equivalent_map,
                 'trampoline_returns': cumulative_trampoline_returns,
                 'callee_exit_mx': callee_exit_mx,
                 'callee_exit_mx_modes': callee_exit_mx_modes,
@@ -1678,6 +1742,8 @@ def main() -> int:
             all_unresolved_indirects.extend(r['unresolved_indirects'])
             pass_unresolved_calls.update(r['unresolved_calls'])
             cumulative_rejected_calls.update(r['rejected_call_targets'])
+            cumulative_equivalences.update(
+                tuple(e) for e in r.get('equivalences', ()))
             cumulative_trampoline_returns.update(
                 r['trampoline_returns_local'])
             if pass_idx == 0:
@@ -1716,6 +1782,21 @@ def main() -> int:
         dirty_now, emitted_now = _scan_dirty_variants(results, parsed)
         cumulative_dirty_variants |= dirty_now
         cumulative_emitted_variants |= emitted_now
+
+        # Push proven-equivalence facts to codegen for this pass's
+        # re-emit (see codegen.set_proven_equivalent / the $01:B898
+        # second-round bug this closes). Rebuilt fresh each pass since
+        # cumulative_equivalences only grows as more variants get
+        # decoded/compared.
+        proven_equivalent_map: dict = {}
+        for (addr, em, ex, sm, sx) in cumulative_equivalences:
+            proven_equivalent_map.setdefault(addr, {}).setdefault(
+                (em, ex), set()).add((sm, sx))
+        set_proven_equivalent({
+            a: {mx: frozenset(sibs) for mx, sibs in per_mx.items()}
+            for a, per_mx in proven_equivalent_map.items()
+        })
+
         prunable = _compute_prunable(
             cumulative_dirty_variants, cumulative_emitted_variants,
             canonical_variants)
@@ -1743,7 +1824,16 @@ def main() -> int:
         pending_variant_entries |= added_entries
         added = len(added_entries)
 
-        if added == 0 and not newly_pruned and not variant_added:
+        # See the equiv_count_before_pass comment above: if this pass
+        # discovered new proven-equivalence facts, force at least one
+        # more pass (skip straight past the convergence/break check
+        # below) so the NEXT emission actually uses them, rather than
+        # writing this pass's already-stale-by-one-pass results as final.
+        equivalences_grew_this_pass = (
+            len(cumulative_equivalences) != equiv_count_before_pass)
+
+        if (added == 0 and not newly_pruned and not variant_added
+                and not equivalences_grew_this_pass):
             # ── Reference-taint prune (convergence guard) ────────────
             # Emit-truth prune + auto-promote have stabilized. The
             # bf8a34b runtime-(m,x) policy still emits wrong-width CALLER
@@ -2206,6 +2296,36 @@ def main() -> int:
                   f"{f.branch_mnem} -> {taken_str} -> ${f.live_pc24:06X}  "
                   f"[dead -> ${f.dead_pc24:06X}]  "
                   f"in ${f.func_entry_pc24:06X} M{f.entry_m}X{f.entry_x}")
+
+    # Proven-equivalence report (2026-07-01). Each entry is a PRUNED
+    # (addr, m, x) variant for which _find_equivalent_variants proved a
+    # surviving sibling decodes identically (PC-for-PC, full instruction
+    # shape) -- so _route_pruned_variant used a hard proof instead of
+    # the cfg-canonical/(1,1)-default/nearest-distance guesses. Flags
+    # cases where the proven sibling ISN'T the cfg-canonical/default
+    # width -- exactly the shape of the $01:B898 bug this check exists
+    # to catch before it reaches a real playthrough (that fix required
+    # a hand-added `entry_mx:0,0` cfg pin; a case like it showing up
+    # here would have been auto-routed correctly with no hand fix).
+    if cumulative_equivalences:
+        print()
+        print(f"=== PROVEN-EQUIVALENT VARIANT ROUTING ===")
+        pruned_with_proof = [
+            (addr, em, ex, sm, sx)
+            for (addr, em, ex, sm, sx) in sorted(cumulative_equivalences)
+            if (addr, em, ex) in cumulative_pruned
+        ]
+        print(f"{len(cumulative_equivalences)} proven-equivalent (variant, "
+              f"sibling) fact(s) found; {len(pruned_with_proof)} apply to "
+              f"a PRUNED variant's dispatch routing")
+        for (addr, em, ex, sm, sx) in pruned_with_proof:
+            bank = (addr >> 16) & 0xFF
+            pc16 = addr & 0xFFFF
+            assumed = canonical_variants.get(addr) or {(1, 1)}
+            flag = ("" if (sm, sx) in assumed
+                    else "  <== DIFFERS FROM CANONICAL/DEFAULT GUESS")
+            print(f"  ${bank:02X}:{pc16:04X} M{em}X{ex} pruned -> proven "
+                  f"M{sm}X{sx}{flag}")
 
     rejected = cumulative_rejected_calls | take_rejected_call_targets()
     if rejected:
