@@ -849,6 +849,26 @@ static const uint8 *SimpleHdma_GetPtr(uint32 p) {
   return RomPtr(p);
 }
 
+/* 2026-06-30: SimpleHdma_GetPtr's RomPtr() call is bounds-safe at the point
+ * of translation (wraps via `% rom_size`), but SimpleHdma_DoLine then walks
+ * that pointer forward with raw `c->table++`/`c->table += 2` and never
+ * re-validates — a table lacking a proper zero-terminator before the ROM
+ * mirror boundary walks the RAW HOST POINTER past the actual malloc'd
+ * buffer, an out-of-bounds READ (ASan: heap-buffer-overflow, common_rtl.c
+ * SimpleHdma_DoLine, table pointer 0 bytes past the 1MB ROM region). Guard
+ * every dereference against BOTH possible backing buffers (g_ram is a fixed
+ * array; g_rom's size is cart-dependent, same calc RomPtr uses) and treat an
+ * out-of-bounds pointer as the natural end-of-table condition instead of
+ * reading past the buffer. */
+static bool SimpleHdma_PtrValid(const uint8 *p) {
+  if (p >= g_ram && p < g_ram + sizeof(g_ram)) return true;
+  extern Snes *g_snes;
+  uint32 rom_size = g_snes && g_snes->cart ? (uint32)g_snes->cart->romSize : 0x80000;
+  if (rom_size == 0) rom_size = 0x80000;
+  if (p >= g_rom && p < g_rom + rom_size) return true;
+  return false;
+}
+
 void SimpleHdma_Init(SimpleHdma *c, DmaChannel *dc) {
   if (!dc->hdmaActive) {
     c->table = 0;
@@ -880,12 +900,17 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
     return;
   bool do_transfer = false;
   if ((c->rep_count & 0x7f) == 0) {
+    if (!SimpleHdma_PtrValid(c->table)) { c->table = NULL; return; }
     c->rep_count = *c->table++;
     if (c->rep_count == 0) {
       c->table = NULL;
       return;
     }
     if(c->mode & 0x40) {
+      if (!SimpleHdma_PtrValid(c->table) || !SimpleHdma_PtrValid(c->table + 1)) {
+        c->table = NULL;
+        return;
+      }
       c->indir_ptr = SimpleHdma_GetPtr(c->indir_bank << 16 | c->table[0] | c->table[1] * 256);
       c->table += 2;
     }
@@ -893,7 +918,10 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
   }
   if(do_transfer || c->rep_count & 0x80) {
     for(int j = 0, j_end = transferLength[c->mode & 7]; j < j_end; j++) {
-      uint8 v = c->mode & 0x40 ? *c->indir_ptr++ : *c->table++;
+      const uint8 *src = c->mode & 0x40 ? c->indir_ptr : c->table;
+      if (!SimpleHdma_PtrValid(src)) { c->table = NULL; break; }
+      uint8 v = *src;
+      if (c->mode & 0x40) c->indir_ptr++; else c->table++;
       uint16 addr = 0x2100 + c->ppu_addr + bAdrOffsets[c->mode & 7][j];
       ppu_write(g_ppu, addr, v);
       debug_server_on_reg_write(addr, v);

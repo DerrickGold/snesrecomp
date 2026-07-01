@@ -139,15 +139,20 @@ void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32_t pc24) {
           fn, pc24, cpu->m_flag & 1, cpu->x_flag & 1, snes_frame_counter);
   for (int i = g_recomp_stack_top - 1; i >= 0; i--)
     fprintf(stderr, "    [%2d] %s\n", i, g_recomp_stack[i] ? g_recomp_stack[i] : "?");
-  /* Block-history ring (pc + m at each block): the trap fires BEFORE the
-   * misdecode loop floods the ring, so this shows the path into the entry,
-   * with the m-flag at each block -> pinpoints the block where m flipped. */
-  extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[]; extern unsigned g_ar_blk_idx;
-  fprintf(stderr, "  block path (pc, m):\n");
-  for (int k = 40; k >= 1; k--) {
+  /* Block-history ring (pc, m, x, S at each block): the trap fires BEFORE the
+   * misdecode loop floods the ring, so this shows the path into the entry --
+   * pinpoints the block where m OR x flipped, and (via S) whether a call
+   * along the way drifted the stack. 2026-06-30: widened from m-only/40-deep
+   * to m+x+S/200-deep (matching the AR_XTRACE dump's format) -- the earlier
+   * m-only version couldn't show an X-flag corruption at all. */
+  extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[];
+  extern uint16_t g_ar_blk_s[]; extern unsigned g_ar_blk_idx;
+  fprintf(stderr, "  block path (pc, m, x, S):\n");
+  for (int k = 200; k >= 1; k--) {
     unsigned idx = (g_ar_blk_idx - (unsigned)k) & 1023u;
-    fprintf(stderr, "    [-%2d] pc=$%06X m=%u\n", k,
-            g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1);
+    fprintf(stderr, "    [-%3d] pc=$%06X m=%u x=%u S=$%04X\n", k,
+            g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1,
+            (g_ar_blk_aux[idx] >> 17) & 1, g_ar_blk_s[idx]);
   }
   fflush(stderr);
 }
@@ -300,6 +305,27 @@ void ar_exit_s_fail(CpuState *cpu, uint32_t entry_s, uint32_t ret_s,
     " (delta %+d) f=%d -> pops a garbage return\n",
     f ? f : "?", pc24, entry_s & 0xFFFF, ret_s & 0xFFFF,
     (int)((int32_t)ret_s - (int32_t)entry_s), snes_frame_counter);
+  fflush(stderr);
+}
+
+/* Call-site invariant check (AR_CALLMX) — see cpu_state.h. Dedup by SITE
+ * (pc24), not function name: a function can have many call sites and each is
+ * an independent point where corruption could first become visible. */
+int g_ar_call_mx_check = 0;
+void ar_call_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32_t pc24) {
+  static uint32_t seen[512];
+  static unsigned nseen = 0, total = 0;
+  for (unsigned i = 0; i < nseen; i++)
+    if (seen[i] == pc24) return;
+  if (nseen < 512) seen[nseen++] = pc24;
+  if (total++ >= 2000) return;
+  extern int snes_frame_counter;
+  fprintf(stderr,
+    "[call-mx] %s call-site $%06X: runtime m=%u x=%u but decoder assumed "
+    "m=%d x=%d here -> (m,x) corrupted between fn entry and this call"
+    "  f=%d\n",
+    fn ? fn : "?", pc24, cpu->m_flag & 1, cpu->x_flag & 1, em, ex,
+    snes_frame_counter);
   fflush(stderr);
 }
 

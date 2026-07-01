@@ -1337,6 +1337,12 @@ def emit_function(rom: bytes, bank: int, start: int,
                   f'skip_emit_idx={sorted(skip_emit_idx)}',
                   file=_sys.stderr, flush=True)
         for ii, (di_insn, ir_ops) in enumerate(pairs):
+            # Call-site context (AR_CALLMX, 2026-06-30): tell codegen the
+            # current instruction's own 24-bit address so _emit_call can
+            # attribute a mid-function m/x invariant check to this exact
+            # site. See codegen.set_current_site_pc24.
+            from v2.codegen import set_current_site_pc24
+            set_current_site_pc24(di_insn.addr & 0xFFFFFF)
             # NLR: inject _pending_skip setter + diagnostics RIGHT BEFORE
             # the terminator insn. This ensures any preceding setup ops
             # have already emitted, and the upcoming Goto/Return picks up

@@ -175,6 +175,21 @@ def set_current_exit_ctx(func_name: str, exit_mx) -> None:
     _CUR_EXIT_MX = exit_mx if (exit_mx and exit_mx[0] is not None) else None
 
 
+# Current instruction's own 24-bit address (AR_CALLMX, 2026-06-30), set by
+# emit_function once per source instruction before emitting its ops. Read by
+# _emit_call to attribute a mid-function m/x invariant check to the exact
+# JSR/JSL site — a general-purpose diagnostic for "runtime (m,x) disagrees
+# with what the decoder statically knew at THIS instruction", which catches
+# state corruption from ANYWHERE upstream (not just decode-time mistakes the
+# entry/exit checks already cover) at the first call site downstream of it.
+_CUR_SITE_PC24: int = 0
+
+
+def set_current_site_pc24(pc24: int) -> None:
+    global _CUR_SITE_PC24
+    _CUR_SITE_PC24 = pc24 & 0xFFFFFF
+
+
 def take_rejected_call_targets() -> set:
     """Return + clear the set of Call targets rejected as out-of-ROM.
     Diagnostic for v2_regen + tests."""
@@ -1888,6 +1903,8 @@ def _emit_call(op: Call) -> List[str]:
             "  uint8 _saved_pb = cpu->PB;",
             f"  cpu_trace_pb_change(cpu, 0, _saved_pb, {target_bank:#04x}, CPU_TR_JSL);",
             f"  cpu->PB = {target_bank:#04x};",
+            f"  ar_call_mx_check(cpu, {op.entry_m & 1}, {op.entry_x & 1}, "
+            f"\"{_CUR_EXIT_NAME}\", 0x{_CUR_SITE_PC24:06x}u);",
             "  RecompReturn _r;",
             "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
         ]
@@ -1916,6 +1933,8 @@ def _emit_call(op: Call) -> List[str]:
     ]
     lines += _emit_return_frame_push(op)
     lines += [
+        f"  ar_call_mx_check(cpu, {op.entry_m & 1}, {op.entry_x & 1}, "
+        f"\"{_CUR_EXIT_NAME}\", 0x{_CUR_SITE_PC24:06x}u);",
         "  RecompReturn _r;",
         "  switch (((cpu->m_flag & 1) << 1) | (cpu->x_flag & 1)) {",
     ]

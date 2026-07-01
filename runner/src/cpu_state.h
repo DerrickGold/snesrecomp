@@ -478,6 +478,27 @@ static inline void ar_exit_s_check(CpuState *cpu, uint16 entry_s, uint16 ret_s,
     ar_exit_s_fail(cpu, entry_s, ret_s, fn, pc24);
 }
 
+/* ── Call-site invariant check (AR_CALLMX, 2026-06-30) ──────────────────
+ * A MID-function twin of ar_entry_mx_check: at every JSR/JSL, verify runtime
+ * (m,x) still matches what the decoder statically knew at THIS instruction
+ * (Call.entry_m/entry_x — the caller's own flags at the call site, since
+ * JSR/JSL don't change M/X). A mismatch means (m,x) was corrupted SOMEWHERE
+ * between function entry (already verified clean by ar_entry_mx_check) and
+ * this call — narrows a "runtime flags disagree with decode" bug down to a
+ * specific instruction, catching corruption from ANYWHERE upstream (not just
+ * decode-time mistakes the entry/exit checks cover), at the first call site
+ * downstream of it. Added chasing the $01:933C -> $01:B898 anomaly (933C's
+ * own generated C, traced instruction-by-instruction, provably never
+ * touches x_flag between entry and this call — yet runtime disagreed). */
+extern int g_ar_call_mx_check;  /* set once from AR_CALLMX env */
+void ar_call_mx_fail(CpuState *cpu, int em, int ex, const char *fn, uint32 pc24);
+static inline void ar_call_mx_check(CpuState *cpu, int em, int ex,
+                                    const char *fn, uint32 pc24) {
+  if (g_ar_call_mx_check
+      && (((cpu->m_flag & 1) != em) || ((cpu->x_flag & 1) != ex)))
+    ar_call_mx_fail(cpu, em, ex, fn, pc24);
+}
+
 /* ── PEI-trampoline dispatch (2026-05-24, narrow detector) ─────────────
  *
  * Codegen emits a trampoline-aware RTS/RTL ONLY for functions flagged
