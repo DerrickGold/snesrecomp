@@ -273,10 +273,20 @@ void ar_garbage_variant_trap(CpuState *cpu, const char *fn, uint32_t pc24) {
       fprintf(stderr, "[garbage-variant]   [%2d] %s\n", i,
               g_recomp_stack[i] ? g_recomp_stack[i] : "?");
     extern uint32_t g_ar_blk_ring[]; extern uint32_t g_ar_blk_aux[]; extern unsigned g_ar_blk_idx;
-    for (int k = 24; k >= 1; k--) {
+    extern uint16_t g_ar_blk_s[];
+    /* AR_GARBAGE_HIST=<n> (default 24, max 1000): how far back to dump. The
+     * 24-block default couldn't reach the m-flip origin in the sim-dev leak
+     * (flip was >24 blocks upstream of the garbage dispatch). Includes S so
+     * an unbalanced call shows as an S jump at the flip point. */
+    static int histn = -1;
+    if (histn < 0) { const char *h = getenv("AR_GARBAGE_HIST");
+      histn = h ? (int)strtoul(h, NULL, 0) : 24;
+      if (histn > 1000) histn = 1000; if (histn < 1) histn = 24; }
+    for (int k = histn; k >= 1; k--) {
       unsigned idx = (g_ar_blk_idx - (unsigned)k) & 1023u;
-      fprintf(stderr, "[garbage-variant]   [-%2d] pc=$%06X m=%u\n", k,
-              g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1);
+      fprintf(stderr, "[garbage-variant]   [-%3d] pc=$%06X m=%u x=%u S=%04X\n", k,
+              g_ar_blk_ring[idx], (g_ar_blk_aux[idx] >> 16) & 1,
+              (g_ar_blk_aux[idx] >> 17) & 1, g_ar_blk_s[idx]);
     }
   }
   /* AR_XTRACE: dump the x-flip history leading INTO this garbage dispatch. Fire

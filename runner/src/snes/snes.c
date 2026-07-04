@@ -342,68 +342,69 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
       static bool yielding;
       if (snes->forceNmi && !yielding && !getenv("AR_NO4210YIELD")) {
-        /* Frame pacing for inline (non-HLE'd) vblank waits. The canonical SNES
-         * wait is three reads in three distinct basic blocks:
-         *     LDA $4210            ; clear  (block A)   -- value discarded
-         *   @sp: LDA $4210; BPL @sp ; spin   (block B)   -- self-looping block
-         *     LDA $4210            ; post   (block C)   -- value discarded
-         * The recomp collapses the spin's hardware busy-loop into a single host
-         * frame. The old "yield whenever the once-per-frame token is consumed"
-         * model yielded on the clear, the spin, AND the post read -> 3 host
-         * frames per logical wait -> the angel sim menu and Mode-7 spiral ran at
-         * ~1/3 speed.
+        /* Frame pacing for inline (non-HLE'd) vblank waits — STATIC WHITELIST
+         * model (2026-07-04, replaces two generations of heuristics).
          *
-         * Distinguish the spin from the isolated clear/post reads by the SNES
-         * block PC, which cpu_trace_block records (unconditionally) into
-         * g_ar_blk_ring before each block runs. A $4210 read whose block PC
-         * REPEATS the previous forced-NMI $4210 read's block is a spin loop
-         * iteration -> yield exactly one frame and return bit7=1 so BPL falls
-         * through. The clear and post reads live in their own one-shot blocks
-         * (no repeat) -> return bit7=0 (not in vblank at this isolated read) and
-         * do NOT yield. Net: one host frame per wait, matching HLE'd $8418/$A85E.
-         * (HLE'd waits don't execute this code at all.) */
-        /* Only pair reads WITHIN the same host frame. A real spin reads $4210
-         * twice with no frame boundary between (the host frame advances only AT
-         * the yielding read). A per-frame NMI-ack like $00:8465 reads $4210 once
-         * per frame; across frames its block PC is identical, which would
-         * false-match as a "spin" and inject spurious yields (observed: action
-         * mode yielding at blk=008465, ~3 host frames per game frame = slow).
-         * Reset the tracker whenever the host frame changes so a read can only
-         * pair with another read from the SAME frame -> $8465's once-per-frame
-         * reads never pair, while the spin's two same-frame reads still do. */
-        extern int snes_frame_counter;
-        static int s_last4210Frame = -1;
-        if (snes_frame_counter != s_last4210Frame) {
-          s_last4210Frame = snes_frame_counter;
-          snes->last4210Block = 0;
-        }
+         * The canonical SNES wait is three reads in three basic blocks:
+         *     LDA $4210            ; clear  -- value discarded, must NOT yield
+         *   @sp: LDA $4210; BPL @sp ; spin   -- the busy wait: yield exactly once
+         *     LDA $4210            ; post   -- value discarded, must NOT yield
+         * plus isolated ACK reads ($00:8465, $01:93CF, $03:AF58) that must
+         * NEVER yield. Two successive heuristics tried to tell these apart at
+         * runtime (same-block re-read; then + same-frame; then + ring-adjacent)
+         * and BOTH shipped a 1/N-speed pacing bug from a false pair ($8465
+         * once-per-frame ack; $93CB twice-per-frame shared ack — DEBUG.md
+         * §7.12). The shapes are fully static, so stop guessing:
+         * tools/find_yield_points.py scans the ROM for every $4210/$4212 read
+         * (ALL addressing forms incl. the long AF one) and classifies each
+         * site; the 6 live SPIN sites below are the COMPLETE legitimate yield
+         * set for ActRaiser (US). Every spin is a `read; BPL @self` block, so
+         * its read PC == its block PC == what cpu_trace_block just recorded.
+         * Yield on the FIRST read from a whitelisted spin block and return
+         * bit7=1 to break the BPL: one host frame per logical wait, exactly
+         * like the HLE'd $8418/$A85E (which never execute this path at all).
+         * Clear/post/ack reads simply return bit7=0, no state to track.
+         *
+         * If the game ever reaches a spin NOT on this list it busy-spins into
+         * the watchdog, whose dump names the block -> re-run the census and
+         * extend the list. Loud-and-obvious beats silently-slow. */
+        static const uint32_t kSpinBlocks[] = {
+          0x019293,  /* $01:9284 intro/menu/effect wait (abs form)   */
+          0x0192AA,  /* $01:929E effect-loop wait (long form)        */
+          0x0287F3,  /* $02:87EC fade/transition helper              */
+          0x029AC4,  /* $02:9AC1 boot sound-init wait — called NATIVELY from
+                      * $02:98E3/98E6/... (the reset-time APU bring-up), not
+                      * only from inside the HLE'd $9964/$9A56 (first census
+                      * wrongly assumed HLE-only -> boot hung in this spin) */
+          0x02BEBF,  /* $02:BEB9 sound-code wait ($BECA = N frames)  */
+          0x03B013,  /* $03:B00B wait (long form)                    */
+          0x03E535,  /* $03:E52D sound-upload bracket wait           */
+        };
         uint32_t blk = g_ar_blk_ring[(g_ar_blk_idx - 1) & 1023u];
-        if (blk != 0 && blk == snes->last4210Block) {
-          /* spin iteration: same block read $4210 twice in a row -> the busy
-           * wait. Pace one frame, then break the loop. */
-          if (getenv("AR_VBLOG")) {
-            extern int snes_frame_counter; extern uint8 g_ram[0x20000];
-            extern Ppu *g_ppu;
-            static int lf = -1;
-            if (snes_frame_counter != lf) {
-              lf = snes_frame_counter;
-              extern uint16 ar_cpu_S(void); extern uint8 ar_cpu_PB(void);
-              uint16 s = ar_cpu_S();
-              fprintf(stderr, "[vbl] f=%d bright=%d fblank=%d bgmode=%02x main=%02x $18=%02x $19=%02x time$E6=%02x%02x HP=%02x PB=%02x S=%04x blk=%06X\n",
-                      snes_frame_counter, g_ppu->inidisp & 0xf,
-                      (g_ppu->inidisp & 0x80) ? 1 : 0, g_ppu->bgmode,
-                      g_ppu->screenEnabled[0], g_ram[0x18], g_ram[0x19],
-                      g_ram[0xE7], g_ram[0xE6], g_ram[0x1D], ar_cpu_PB(), s, blk);
+        for (unsigned i = 0; i < sizeof(kSpinBlocks) / sizeof(kSpinBlocks[0]); i++) {
+          if (blk == kSpinBlocks[i]) {
+            if (getenv("AR_VBLOG")) {
+              extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+              extern Ppu *g_ppu;
+              static int lf = -1;
+              if (snes_frame_counter != lf) {
+                lf = snes_frame_counter;
+                extern uint16 ar_cpu_S(void); extern uint8 ar_cpu_PB(void);
+                uint16 s = ar_cpu_S();
+                fprintf(stderr, "[vbl] f=%d bright=%d fblank=%d bgmode=%02x main=%02x $18=%02x $19=%02x time$E6=%02x%02x HP=%02x PB=%02x S=%04x blk=%06X\n",
+                        snes_frame_counter, g_ppu->inidisp & 0xf,
+                        (g_ppu->inidisp & 0x80) ? 1 : 0, g_ppu->bgmode,
+                        g_ppu->screenEnabled[0], g_ram[0x18], g_ram[0x19],
+                        g_ram[0xE7], g_ram[0xE6], g_ram[0x1D], ar_cpu_PB(), s, blk);
+              }
             }
+            yielding = true;
+            ActRaiser_YieldToHost();
+            yielding = false;
+            return 0x82;            /* CPU version 2 + bit7=1: vblank seen */
           }
-          yielding = true;
-          ActRaiser_YieldToHost();
-          yielding = false;
-          snes->last4210Block = 0;  /* episode done; don't fold the post read in */
-          return 0x82;              /* CPU version 2 + bit7=1 (NMI/vblank seen) */
         }
-        snes->last4210Block = blk;
-        return 0x02;                /* CPU version 2, bit7=0: not in vblank now */
+        return 0x02;                /* clear/post/ack read: bit7=0, no yield */
       }
       uint8_t val = 0x2; // CPU version (4 bit)
       bool nmi = snes->inNmi || snes->forceNmi;

@@ -1402,6 +1402,38 @@ static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
    * actually executes each frame: $008125 (skip path) vs $0080F6 (continue path).
    * Also watched: $008066 (action-stage path -- should NEVER fire while $18==0)
    * and $0080E5 (sim-dispatch entry, confirms the outer gate is even reached). */
+  /* AR_SIMDEV=1 (2026-07-04): sim development-cycle never fires. The oracle
+   * diff proved the chain upstream of the development `COP $9C` is dead in the
+   * recomp: per-town eligibility $7F:9758+X never written post-init because
+   * bank_03_933C (runs 125x/session) always aborts before `JSR $8CF9`. Watch
+   * the gate branch targets inside 933C to name the failing gate:
+   *   $03:93D2 gate1 ($9D9F record-alloc) PASSED; $03:93DB gate2 ($8D18
+   *   site-scan) PASSED; $03:9400 gate3 ($8C84 map-write) PASSED = scheduled;
+   *   $03:943C/$03:943D abort exits; $03:93C0 candidate-store entry. */
+  {
+    static int sd_en = -1;
+    if (sd_en < 0) sd_en = getenv("AR_SIMDEV") ? 1 : 0;
+    if (sd_en && (pc24 == 0x0393C0u || pc24 == 0x0393D2u || pc24 == 0x0393DBu
+                  || pc24 == 0x039400u || pc24 == 0x03943Cu || pc24 == 0x03943Du)) {
+      static int sd_lines;
+      if (sd_lines < 400) {
+        sd_lines++;
+        extern int snes_frame_counter;
+        extern uint8 g_ram[0x20000];
+        const char *tag = (pc24 == 0x0393C0u) ? "candidate"
+                        : (pc24 == 0x0393D2u) ? "gate1-PASS(9D9F)"
+                        : (pc24 == 0x0393DBu) ? "gate2-PASS(8D18)"
+                        : (pc24 == 0x039400u) ? "gate3-PASS(8C84)->SCHEDULED"
+                        : "ABORT-exit";
+        fprintf(stderr, "[simdev] f=%d pc=$%06X %s A=%04x X=%04x "
+                "$7C9D=%02x%02x $7CA1=%02x $7BFB=%02x%02x\n",
+                snes_frame_counter, pc24, tag, cpu->A, cpu->X,
+                g_ram[0x7C9E], g_ram[0x7C9D], g_ram[0x7CA1],
+                g_ram[0x7BFC], g_ram[0x7BFB]);
+        if (sd_lines == 400) fprintf(stderr, "[simdev] (cap reached)\n");
+      }
+    }
+  }
   {
     static int st_en = -1;
     if (st_en < 0) st_en = getenv("AR_SIMTRACE") ? 1 : 0;
