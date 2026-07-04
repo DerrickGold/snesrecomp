@@ -1671,6 +1671,23 @@ def emit_function(rom: bytes, bank: int, start: int,
                         for _entry in di_insn.dispatch_entries:
                             _t16 = _entry & 0xFFFF
                             _tgt = f"L_{_t16:04X}_M{key.m}X{key.x}"
+                            # Only emit a case whose target block was actually
+                            # decoded IN THIS VARIANT. Wrong-width sibling
+                            # variants (e.g. the M1Xx garbage decode of an
+                            # m=0-only region) can reach this RTS site without
+                            # ever decoding the continuation block; an
+                            # unconditional `goto` then references an
+                            # undeclared label -> build failure (seen 2026-07-04
+                            # with `rts_dispatch 93AA 9316`: L_9316_M1X0 emitted
+                            # in bank_03 M1X0/M1X1 variants that never decode
+                            # $9316). Falling through to the default (normal
+                            # return) is the correct behavior for a variant
+                            # that can't host the continuation.
+                            if _tgt not in local_labels:
+                                lines.append(
+                                    f"    /* case 0x{_t16:04X}: {_tgt} not "
+                                    f"decoded in this variant -> default */")
+                                continue
                             lines.append(
                                 f"    case 0x{_t16:04X}: "
                                 f"cpu->S = (uint16)(_rts_s + 2); goto {_tgt};")
