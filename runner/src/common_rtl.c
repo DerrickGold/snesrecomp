@@ -595,6 +595,71 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
     }
   }
 
+  /* Stage 2 — BRR sample streaming ($02:9964 callers only). The native
+   * $9964 is NOT just a wrapper around the $9A56 block-image upload: after
+   * JSR $9A56 it re-handshakes with the resident uploader and streams raw
+   * sample chunks from a length-prefixed pool at ROM $08:8000 into ARAM.
+   * The image terminator's target word doubles as the stage-2 script: its
+   * LOW byte is the segment count, and the script's index bytes start at
+   * the HIGH byte and continue past the terminator. Each index selects a
+   * [len16][data...] chunk from the pool (scanned linearly, LoROM
+   * bank-contiguous); chunks land back-to-back in ARAM starting at WRAM
+   * $0358 (boot preloads $3000 for the 12-sample common bank; the boot
+   * caller then sets $0358 = DP$02+DP$08 = end-of-common for song banks).
+   * Verified against the DSP sample directory: title segments land at
+   * $3000/$3B01/.../$6E4C = srcn 00-0B exactly; song-7 segments at
+   * $795F/.../$B89E = srcn 0C-12 exactly. Without this stage every DIR
+   * entry points at zero-filled ARAM -> voices key on but decode silence
+   * (the "engine runs, no audio" symptom).
+   *
+   * The direct-$9A56 path (boot mini-driver upload) has no stage 2; gate on
+   * the wrapper name, same trick RtlUploadSpcImageFromDp uses for the
+   * return-frame size. */
+  {
+    extern const char *g_last_recomp_func;
+    int is_9964 = g_last_recomp_func && strstr(g_last_recomp_func, "9964");
+    int seg_count = final_pc & 0xff;
+    if (is_9964 && seg_count > 0) {
+      const uint8_t *script = p - 1;      /* terminator target high byte */
+      const uint8_t *pool = RomPtr(0x088000);
+      uint16_t dest = (uint16_t)(g_ram[0x358] | (g_ram[0x359] << 8));
+      uint16_t prev_len = 0, last_len = 0, last_dest = dest;
+      for (int s = 0; s < seg_count; s++) {
+        uint8_t idx = *script++;
+        dest = (uint16_t)(dest + prev_len);
+        const uint8_t *q = pool;
+        int bad = 0;
+        for (int k = 0; k < idx; k++) {
+          uint16_t skip = (uint16_t)(q[0] | (q[1] << 8));
+          q += 2 + skip;
+          if (q - pool > 0x60000) { bad = 1; break; }  /* runaway script */
+        }
+        if (bad) {
+          fprintf(stderr, "[apu] stage2: bad chunk index %u (seg %d), aborting\n",
+                  idx, s);
+          break;
+        }
+        uint16_t len = (uint16_t)(q[0] | (q[1] << 8));
+        q += 2;
+        for (uint32_t i = 0; i < len; i++)
+          g_snes->apu->ram[(uint16_t)(dest + i)] = q[i];
+        if (ulog)
+          fprintf(stderr, "[apu]   stage2 seg %d: chunk %u -> ARAM %04x..%04x (len %#x)\n",
+                  s, idx, dest, (uint16_t)(dest + len), len);
+        prev_len = len; last_len = len; last_dest = dest;
+      }
+      /* Native exit state the boot caller depends on ($02:9957 computes the
+       * next $0358 as DP$02 + DP$08 = last dest + last length): */
+      uint16_t d = cpu->D;
+      g_ram[(uint16_t)(d + 0)] = 0;                       /* STZ $00/$01 */
+      g_ram[(uint16_t)(d + 1)] = 0;
+      g_ram[(uint16_t)(d + 2)] = (uint8_t)last_dest;      /* DP $02 */
+      g_ram[(uint16_t)(d + 3)] = (uint8_t)(last_dest >> 8);
+      g_ram[(uint16_t)(d + 8)] = (uint8_t)last_len;       /* DP $08 */
+      g_ram[(uint16_t)(d + 9)] = (uint8_t)(last_len >> 8);
+    }
+  }
+
   /* First-upload vs subsequent-upload semantics differ. The very first
    * upload from CPU after reset goes through the SNES SPC IPL bootROM,
    * which ends with `JMP [$0000+X]` — i.e. the IPL jumps to the entry

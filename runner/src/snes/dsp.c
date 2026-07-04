@@ -284,6 +284,19 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
       uint16_t samplePointer = dsp->dirPage + 4 * dsp->channel[ch].srcn;
       dsp->channel[ch].decodeOffset = dsp->apu_ram[samplePointer];
       dsp->channel[ch].decodeOffset |= dsp->apu_ram[(samplePointer + 1) & 0xffff] << 8;
+      if(getenv("AR_KONLOG")) {
+        uint16_t off = dsp->channel[ch].decodeOffset;
+        fprintf(stderr, "[konapply] ch=%d srcn=%02x dirPage=%04x ptr@%04x brr@%04x "
+                "brr[0..3]=%02x %02x %02x %02x volL=%d volR=%d pitch=%04x "
+                "useGain=%d aRates=%u,%u,%u,%u\n",
+                ch, dsp->channel[ch].srcn, dsp->dirPage, samplePointer, off,
+                dsp->apu_ram[off], dsp->apu_ram[(off+1)&0xffff],
+                dsp->apu_ram[(off+2)&0xffff], dsp->apu_ram[(off+3)&0xffff],
+                dsp->channel[ch].volumeL, dsp->channel[ch].volumeR,
+                dsp->channel[ch].pitch, (int)dsp->channel[ch].useGain,
+                dsp->channel[ch].adsrRates[0], dsp->channel[ch].adsrRates[1],
+                dsp->channel[ch].adsrRates[2], dsp->channel[ch].adsrRates[3]);
+      }
       memset(dsp->channel[ch].decodeBuffer, 0, sizeof(dsp->channel[ch].decodeBuffer));
       dsp->channel[ch].gain = 0;
       dsp->channel[ch].adsrState = dsp->channel[ch].useGain ? 3 : 0;
@@ -517,6 +530,12 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
     case 0x4c: {
       // Latch only; the per-channel poll in dsp_cycleChannel applies
       // KON every other sample with KOF priority (hardware behavior).
+      if(getenv("AR_KONLOG") && val) {
+        extern int snes_frame_counter;
+        fprintf(stderr, "[konlog] f=%d KON=%02x KOF=%02x FLG mute=%d DIR=%02x mvolL=%d\n",
+                snes_frame_counter, val, dsp->ram[0x5c], (int)dsp->mute,
+                dsp->ram[0x5d], dsp->masterVolumeL);
+      }
       for(int ch = 0; ch < 8; ch++) {
         dsp->channel[ch].keyOn = val & (1 << ch);
       }
