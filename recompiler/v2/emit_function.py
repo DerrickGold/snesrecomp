@@ -1668,9 +1668,21 @@ def emit_function(rom: bytes, bank: int, start: int,
                             "(uint16)(_rts_s + 2)) << 8) | cpu_read8(cpu, 0x00, "
                             "(uint16)(_rts_s + 1))) + 1);")
                         lines.append("  switch (_rts_t) {")
+                        # Label suffix must use the RTS INSN's decoded (m,x),
+                        # NOT the block key's: a mid-block SEP/REP between the
+                        # block leader and the RTS (e.g. $03:9EEE SEP #$20 with
+                        # the block starting at $9EDC, m=0) means the decoder
+                        # added + decoded the dispatch targets at the insn's
+                        # flags (L_xxxx_M1X0) while the block key still says
+                        # M0X0 — the old key-based lookup then found no label
+                        # and the guard silently emitted an empty switch (every
+                        # dispatch fell to default = the exact silent-skip the
+                        # directive exists to prevent).
+                        _im = di_insn.m_flag & 1
+                        _ix = di_insn.x_flag & 1
                         for _entry in di_insn.dispatch_entries:
                             _t16 = _entry & 0xFFFF
-                            _tgt = f"L_{_t16:04X}_M{key.m}X{key.x}"
+                            _tgt = f"L_{_t16:04X}_M{_im}X{_ix}"
                             # Only emit a case whose target block was actually
                             # decoded IN THIS VARIANT. Wrong-width sibling
                             # variants (e.g. the M1Xx garbage decode of an
