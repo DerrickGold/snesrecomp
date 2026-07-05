@@ -1433,6 +1433,36 @@ static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
         if (sd_lines == 400) fprintf(stderr, "[simdev] (cap reached)\n");
       }
     }
+    /* AR_SIMDEV2=1 (2026-07-04, round 4): eligibility $7F:9758=$00D0 is now
+     * SET but only survives ~38 frames (oracle: 266) so the periodic COP-$9C
+     * people-spawn scene misses the window. Trace the scene gate + the
+     * completion that clears the slot. $8349 = enter $839C census; $8356 gate
+     * ($8362 COP $9C fires iff census A!=0, else BEQ $8392); $8362 COP fires;
+     * $89F7 = the per-frame build-animation tick ($7C97 step, $7CFB active);
+     * $8440 = the completion that draws the house + clears $9758,X to $FFFF. */
+    static int sd2 = -1;
+    if (sd2 < 0) sd2 = getenv("AR_SIMDEV2") ? 1 : 0;
+    if (sd2 && (pc24 == 0x038349u || pc24 == 0x038356u || pc24 == 0x038362u
+                || pc24 == 0x0389F7u || pc24 == 0x038440u || pc24 == 0x03846Cu
+                || pc24 == 0x038D09u)) {
+      static int n2;
+      if (n2 < 500) {
+        n2++;
+        extern int snes_frame_counter;
+        extern uint8 g_ram[0x20000];
+        const char *tag = (pc24==0x038349u)?"census-call($839C)"
+                        : (pc24==0x038356u)?"GATE($8356 BEQ->skip if A=0)"
+                        : (pc24==0x038362u)?"*** COP $9C POSTED ***"
+                        : (pc24==0x0389F7u)?"anim-tick($89F7)"
+                        : (pc24==0x038440u)?"completion-scan($8440)"
+                        : (pc24==0x03846Cu)?"CLEAR $9758=$FFFF ($846C)"
+                        : "SET-elig($8D09)";
+        unsigned e58 = g_ram[0x19758] | (g_ram[0x19759]<<8);
+        fprintf(stderr, "[simdev2] f=%d %s A=%04x $7C97=%02x $7CFB=%02x "
+                "$7F9758=%04x\n", snes_frame_counter, tag, cpu->A,
+                g_ram[0x7C97], g_ram[0x7CFB], e58);
+      }
+    }
   }
   {
     static int st_en = -1;
