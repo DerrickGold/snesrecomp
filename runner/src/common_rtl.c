@@ -305,7 +305,27 @@ uint16 ReadRegWord(uint16 reg) {
 
 static void WriteVramWord(Ppu *ppu, uint16 value) {
   uint16_t adr = ppu->vramPointer;
+  /* AR_VWORD=1: log atomic 16-bit STA $2118 writes into the $0000 graphics
+   * region (the lair-seal corruptor bypasses $2118-byte watches via this path),
+   * host-frame gated (AR_HF_LO/HI), with the issuing recomp func + block PC. */
+  { static int en=-1; static long lo,hi; if(en<0){en=getenv("AR_VWORD")?1:0;
+      const char*a=getenv("AR_HF_LO"),*b=getenv("AR_HF_HI");
+      lo=a?atol(a):-1; hi=b?atol(b):-1;}
+    if(en && (adr&0x7fff) < 0x1000){
+      extern int snes_frame_counter; extern const char *g_last_recomp_func;
+      extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+      if(lo<0||(snes_frame_counter>=lo&&(hi<0||snes_frame_counter<=hi))){
+        static int nl; if(nl++<20000){
+          uint32_t blk=g_ar_blk_ring[(g_ar_blk_idx-1u)&1023u];
+          fprintf(stderr,"[vword] hf=%d vram=$%04x val=$%04x blk=$%06X func=%s\n",
+            snes_frame_counter, adr&0x7fff, value, blk,
+            g_last_recomp_func?g_last_recomp_func:"?"); } } } }
   ppu->vram[adr & 0x7fff] = value;
+  /* Unified AR_TRACE — this atomic-word path bypasses ppu WriteReg $2118/$2119,
+   * so it was invisible to byte-level VRAM watches; log it on the same channel. */
+  { extern int ar_trace_active(void);
+    extern void ar_trace_vram(uint16_t vaddr, uint16_t val, const char *path);
+    if (ar_trace_active()) ar_trace_vram(adr & 0x7fff, value, "word"); }
   // Atomic 16-bit STA $2118 hits both VRAM bytes at this word; record
   // each as a byte event so the differ can compare against the
   // oracle's REGISTER_2118 + REGISTER_2119 byte sequence.

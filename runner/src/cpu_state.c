@@ -417,6 +417,9 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
             }
         }
         cpu->ram[off] = v;
+        { extern int ar_trace_active(void);
+          extern void ar_trace_wram(uint32_t, uint16_t, uint16_t, int);
+          if (ar_trace_active()) ar_trace_wram((uint32_t)off, (uint16_t)old, (uint16_t)v, 1); }
         cpu_trace_wram_write_check(cpu, bank, addr, off,
                                    (uint16)old, (uint16)v, 1);
         /* Also route through the dedicated 1M-entry WRAM-only ring so
@@ -510,6 +513,9 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
                 fprintf(stderr, "\n");
             }
         }
+        { extern int ar_trace_active(void);
+          extern void ar_trace_wram(uint32_t, uint16_t, uint16_t, int);
+          if (ar_trace_active()) ar_trace_wram((uint32_t)off, old, v, 2); }
         cpu_trace_wram_write_check(cpu, bank, addr, off, old, v, 2);
 #if SNESRECOMP_REVERSE_DEBUG
         extern void debug_on_wram_write_word(uint32_t, uint16_t, uint16_t);
@@ -939,6 +945,10 @@ static RecompReturn _cpu_dispatch_once(CpuState *cpu, uint32 pc24,
          * suppress entirely with AR_NODISPWARN=1, add the call stack with
          * AR_DISPWARN=1. See DEBUG.md "Dispatch-miss / RTS-trick" section. */
         {
+            /* Unified AR_TRACE dispmiss channel — every miss in-window, no dedup. */
+            { extern int ar_trace_active(void);
+              extern void ar_trace_dispmiss(uint32_t, uint32_t);
+              if (ar_trace_active()) ar_trace_dispmiss(source_pc24, pc24); }
             static int warn = -1, warnall = -1;
             if (warn < 0) warn = getenv("AR_NODISPWARN") ? 0 : 1;
             if (warnall < 0) warnall = getenv("AR_DISPWARN") ? 1 : 0;

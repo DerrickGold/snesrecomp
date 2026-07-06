@@ -12,6 +12,9 @@
 #include "../debug_server.h"
 #include "snes_regs.h"
 
+extern void ar_vramraw(uint16_t vaddr, uint8_t val, int port);
+#include "../ar_trace.h"
+
 
 extern bool g_new_ppu;
 void PpuDrawWholeLineOldPpu(Ppu *ppu, int line);
@@ -984,6 +987,17 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
     }
     case 0x39: {
       uint16_t val = ppu->vramReadBuffer;
+      /* AR_BAFREAD=1: log the source addr + returned word of BAF5's $2139
+       * readback, host-frame gated (AR_HF_LO/HI), to see the true read region. */
+      { static int en=-1; static long lo,hi; if(en<0){en=getenv("AR_BAFREAD")?1:0;
+          const char*a=getenv("AR_HF_LO"),*b=getenv("AR_HF_HI");
+          lo=a?atol(a):-1; hi=b?atol(b):-1;}
+        if(en){ extern const char *g_last_recomp_func; extern int snes_frame_counter;
+          const char*f=g_last_recomp_func;
+          if(f&&f[8]=='B'&&f[9]=='A'&&f[10]=='F'&&(lo<0||(snes_frame_counter>=lo&&(hi<0||snes_frame_counter<=hi)))){
+            static int nl; if(nl++<64)
+              fprintf(stderr,"[bafread] hf=%d vramPtr=$%04x readBuf=$%04x remap=$%04x\n",
+                snes_frame_counter, ppu->vramPointer, ppu->vramReadBuffer, ppu_getVramRemap(ppu)&0x7fff); } } }
       if(!ppu->vramIncrementOnHigh) {
         ppu->vramReadBuffer = ppu->vram[ppu_getVramRemap(ppu) & 0x7fff];
         ppu->vramPointer += ppu->vramIncrement;
@@ -1089,6 +1103,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
           g_last_recomp_func ? g_last_recomp_func : "?");
       }
       ppu->inidisp = val;
+      if (ar_trace_active()) ar_trace_reg(0x2100, val); /* brightness + forced-blank */
       break;
     case OBSEL & 0xff:
       ppu->obsel = val;
@@ -1122,6 +1137,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
           uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
           ppu->oam[ppu->oamAdr++] = word;
           debug_server_on_oam_write(0, widx, word);
+          if (ar_trace_active()) ar_trace_ppumem("oam", widx, word); /* sprite word */
           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
         }
       }
@@ -1131,9 +1147,11 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case BGMODE & 0xff:
       assert((val & 0xf0) == 0);
       ppu->bgmode = val;
+      if (ar_trace_active()) ar_trace_reg(0x2105, val);
       break;
     case MOSAIC & 0xff:
       ppu->mosaic = val;
+      if (ar_trace_active()) ar_trace_reg(0x2106, val);
       ppu->mosaicStartLine = 0;// ppu->snes->vPos;
       break;
     case BG1SC & 0xff:
@@ -1141,12 +1159,15 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case BG3SC & 0xff:
     case BG4SC & 0xff:
       ppu->bgXsc[adr - 7] = val;
+      if (ar_trace_active()) ar_trace_reg(0x2100 | adr, val);
       break;
     case BG12NBA & 0xff:
       ppu->bgTileAdr = ppu->bgTileAdr & 0xff00 | val;
+      if (ar_trace_active()) ar_trace_reg(0x210B, val);
       break;
     case BG34NBA & 0xff:
       ppu->bgTileAdr = ppu->bgTileAdr & 0xff | val << 8;
+      if (ar_trace_active()) ar_trace_reg(0x210C, val);
       break;
     case 0x0d: {
       ppu->m7matrix[6] = ((val << 8) | ppu->m7prev) & 0x1fff;
@@ -1193,6 +1214,32 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case 0x17: {
       ppu->vramPointer = (ppu->vramPointer & 0x00ff) | (val << 8);
       ppu->vramReadBuffer = ppu->vram[ppu_getVramRemap(ppu) & 0x7fff];
+      if (ar_trace_active()) ar_trace_vmadd(ppu->vramPointer, "2117");
+      /* AR_BAFSRC=1: log the VRAM address BAF5 sets before its readback
+       * ($7F:B800 fill via $2139). Reveals whether the readback source is the
+       * graphics region ($0000) or a wrong tilemap region ($6800) at the seal. */
+      { static int en = -1; if (en < 0) en = getenv("AR_BAFSRC") ? 1 : 0;
+        if (en) { extern const char *g_last_recomp_func; extern uint8 g_ram[0x20000];
+          const char *f = g_last_recomp_func;
+          if (f && (f[8]=='B'&&f[9]=='A'&&f[10]=='F')) {
+            unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+            static unsigned lastgf = 0xffffffff;
+            if (gf != lastgf) { lastgf = gf;
+              fprintf(stderr, "[bafsrc] gf=%u vramPointer=$%04x func=%s\n",
+                      gf, ppu->vramPointer, f); } } } }
+      /* AR_VMADD=1: log every VMADD ($2116/$2117) set with func + block PC,
+       * host-frame gated (AR_HF_LO/HI) — trace the crossed VRAM pointer. */
+      { static int en=-1; static long lo,hi; if(en<0){en=getenv("AR_VMADD")?1:0;
+          const char*a=getenv("AR_HF_LO"),*b=getenv("AR_HF_HI");
+          lo=a?atol(a):-1; hi=b?atol(b):-1;}
+        if(en){ extern const char *g_last_recomp_func; extern int snes_frame_counter;
+          extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+          if(lo<0||(snes_frame_counter>=lo&&(hi<0||snes_frame_counter<=hi))){
+            static int nl; if(nl++<400){
+              uint32_t blk=g_ar_blk_ring[(g_ar_blk_idx-1u)&1023u];
+              fprintf(stderr,"[vmadd] hf=%d VMADD=$%04x blk=$%06X func=%s\n",
+                snes_frame_counter, ppu->vramPointer, blk,
+                g_last_recomp_func?g_last_recomp_func:"?"); } } } }
       break;
     }
     case 0x18: {
@@ -1201,12 +1248,24 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+      /* AR_VRAMWATCH=1 (2026-07-05): lair-seal tilemap corruption. Log every
+       * VRAM write into the BG tilemap region [$0000,$1000) with the game func
+       * that issued it, within a frame window (AR_VW_LO/AR_VW_HI, game-frame),
+       * to catch who scatters the lair tiles. Rate-limited. */
+      {
+        extern int ar_vramwatch(uint16_t vaddr, uint8_t val);
+        ar_vramwatch(vramAdr & 0x7fff, val);
+      }
+      ar_vramraw(vramAdr & 0x7fff, val, 0x18);
+      if (ar_trace_active()) ar_trace_vram(vramAdr & 0x7fff, val, "b18");
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }
     case 0x19: {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
+      ar_vramraw(vramAdr & 0x7fff, val, 0x19);
+      if (ar_trace_active()) ar_trace_vram(vramAdr & 0x7fff, val, "b19");
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
@@ -1235,7 +1294,10 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       if(!ppu->cgramSecondWrite) {
         ppu->cgramBuffer = val;
       } else {
-        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+        uint16_t centry = ppu->cgramPointer;
+        uint16_t cval = (val << 8) | ppu->cgramBuffer;
+        ppu->cgram[ppu->cgramPointer++] = cval;
+        if (ar_trace_active()) ar_trace_ppumem("cgram", centry, cval); /* palette word */
       }
       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
       break;
@@ -1268,9 +1330,11 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       break;
     case TM & 0xff:
       ppu->screenEnabled[0] = val;
+      if (ar_trace_active()) ar_trace_reg(0x212C, val); /* main-screen layer enable */
       break;
     case TS & 0xff:
       ppu->screenEnabled[1] = val;
+      if (ar_trace_active()) ar_trace_reg(0x212D, val); /* sub-screen layer enable */
       break;
     case TMW & 0xff:
       ppu->screenWindowed[0] = val;

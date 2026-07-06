@@ -9,6 +9,7 @@
 
 #include "dma.h"
 #include "snes.h"
+#include "../ar_trace.h"
 
 static const int bAdrOffsets[8][4] = {
   {0, 0, 0, 0},
@@ -226,6 +227,48 @@ void dma_doDma(Dma* dma) {
               g_last_recomp_func ? g_last_recomp_func : "?");
     }
   }
+  /* AR_LAIRDMA=1: log the START of each VRAM DMA (bAdr $18/$19 = VMDATA) with
+   * its source (aBank:aAdr) + dest + size — to find the garbage tilemap-source
+   * buffer behind the lair-seal top-strip corruption. Fires once per burst
+   * (offIndex==0 && full size). Gated on game-frame window AR_VW_LO/HI. */
+  {
+    static int ld = -1; static unsigned lo, hi;
+    if (ld < 0) { ld = getenv("AR_LAIRDMA") ? atoi(getenv("AR_LAIRDMA")) : 0;
+      const char *l = getenv("AR_VW_LO"), *h = getenv("AR_VW_HI");
+      lo = l ? (unsigned)strtoul(l, NULL, 0) : 0;
+      hi = h ? (unsigned)strtoul(h, NULL, 0) : 0xffffffffu; }
+    extern Ppu *g_ppu;
+    if (ld && !dma->channel[i].fromB && dma->channel[i].offIndex == 0
+        && (dma->channel[i].bAdr == 0x18 || dma->channel[i].bAdr == 0x19)
+        && (ld >= 2 || g_ppu->vramPointer < 0x1000) /* ld>=2: all VRAM dests */
+        && dma->channel[i].size >= dma->channel[i].size /* burst-start proxy */) {
+      extern uint8 g_ram[0x20000];
+      unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+      /* one line per burst: only when vramPointer is at the burst start (a
+       * fresh $2116 set) — approximate by logging the first offIndex==0 whose
+       * dest we haven't seen this frame */
+      static unsigned last_gf2 = 0xffffffff, seen_dst;
+      int fresh = 1;
+      if (gf != last_gf2) { last_gf2 = gf; seen_dst = 0xffffffff; }
+      if (g_ppu->vramPointer == seen_dst) fresh = 0;
+      seen_dst = g_ppu->vramPointer;
+      if (fresh && gf >= lo && gf <= hi) {
+        static int nl; if (nl < 4000) { nl++;
+          extern Ppu *g_ppu; extern const char *g_last_recomp_func;
+          unsigned ab = dma->channel[i].aBank, aa = dma->channel[i].aAdr;
+          char sb[40] = "(non-WRAM)";
+          if (ab == 0x7E || ab == 0x7F) { unsigned b = ((ab & 1) << 16) | aa;
+            snprintf(sb, sizeof sb, "%02x %02x %02x %02x %02x %02x",
+              g_ram[b], g_ram[(b+1)&0x1ffff], g_ram[(b+2)&0x1ffff],
+              g_ram[(b+3)&0x1ffff], g_ram[(b+4)&0x1ffff], g_ram[(b+5)&0x1ffff]); }
+          fprintf(stderr, "[lairdma] gf=%u src=$%02x:%04x vram=$%04x size=%u "
+            "src[0..5]=%s func=%s\n", gf, ab, aa, g_ppu->vramPointer,
+            (unsigned)dma->channel[i].size, sb,
+            g_last_recomp_func ? g_last_recomp_func : "?");
+        }
+      }
+    }
+  }
   // do channel i
   dma_transferByte(
     dma, dma->channel[i].aAdr, dma->channel[i].aBank,
@@ -270,6 +313,10 @@ void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
       dma->channel[i].hdmaActive = val & (1 << i);
     } else {
       dma->channel[i].dmaActive = val & (1 << i);
+      if ((val & (1 << i)) && ar_trace_active())
+        ar_trace_dma(i, dma->channel[i].bAdr, dma->channel[i].aBank,
+                     dma->channel[i].aAdr, dma->channel[i].size,
+                     dma->channel[i].fromB);
     }
   }
   if(!hdma) {

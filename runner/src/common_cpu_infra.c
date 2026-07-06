@@ -244,6 +244,10 @@ void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32_t pc24) {
  * the recomp call stack + block ring; AR_GARBAGE_ABORT=1 aborts on first hit;
  * AR_NOGARBAGEWARN=1 silences. See DEBUG.md "garbage-variant trap". */
 void ar_garbage_variant_trap(CpuState *cpu, const char *fn, uint32_t pc24) {
+  /* Unified AR_TRACE garbage channel — every misdecode-variant entry in-window. */
+  { extern int ar_trace_active(void);
+    extern void ar_trace_garbage(uint32_t, const char *, int, int);
+    if (ar_trace_active()) ar_trace_garbage(pc24, fn, cpu->m_flag & 1, cpu->x_flag & 1); }
   static int en = -1, full = -1, doabort = -1;
   if (en < 0) en = getenv("AR_NOGARBAGEWARN") ? 0 : 1;
   if (!en) return;
@@ -1022,6 +1026,10 @@ void WatchdogCheck(void) {
      * run during a hang). Weak so non-app linkers don't require it. */
     { extern void DumpDiagState(const char *) __attribute__((weak));
       if (DumpDiagState) DumpDiagState("watchdog"); }
+    /* Also flush the AR_TRACE_WATCH ring: a hang is exactly the case the always-on
+     * capture exists for — the ring holds the lead-up to the spin. */
+    { extern void ar_trace_flush(const char *) __attribute__((weak));
+      if (ar_trace_flush) ar_trace_flush("watchdog"); }
     g_watchdog_enabled = 0;
     g_watchdog_tripped = 1;
     { extern int snes_frame_counter;
@@ -1064,3 +1072,75 @@ Snes *SnesInit(const uint8 *data, int data_size) {
   return g_snes;
 }
 
+
+/* AR_VRAMWATCH: BG-tilemap VRAM-write tracer (lair-seal corruption hunt). Logs
+ * writes into [$0000,$1000) word range with the issuing game function + game
+ * frame, within [AR_VW_LO,AR_VW_HI] game-frames. Dedups per (func,vaddr-hi). */
+/* AR_VRAMRAW=1: un-deduped raw VMDATA-write log for a tiny VRAM window
+ * [0,AR_VRAW_VHI] within game-frames [AR_VW_LO,AR_VW_HI]. Logs EVERY $2118/$2119
+ * write (port arg) with the issuing func + block PC — to catch a writer the
+ * deduped ar_vramwatch collapses or misses. */
+void ar_vramraw(uint16_t vaddr, uint8_t val, int port) {
+  static int en = -1; static unsigned lo, hi, vhi;
+  if (en < 0) { en = getenv("AR_VRAMRAW") ? 1 : 0;
+    const char *l = getenv("AR_VW_LO"), *h = getenv("AR_VW_HI"), *v = getenv("AR_VRAW_VHI");
+    lo = l ? (unsigned)strtoul(l, NULL, 0) : 0;
+    hi = h ? (unsigned)strtoul(h, NULL, 0) : 0xffffffffu;
+    vhi = v ? (unsigned)strtoul(v, NULL, 0) : 4; }
+  if (!en) return;
+  if (vaddr > vhi) return;
+  extern uint8_t g_ram[0x20000];
+  extern int snes_frame_counter;
+  /* AR_HF_LO/HI: gate on HOST frame (monotonic) instead of game-frame $0088,
+   * which is unreliable near the cutscene. */
+  static long hflo = -2, hfhi = -2;
+  if (hflo == -2) { const char *a = getenv("AR_HF_LO"), *b = getenv("AR_HF_HI");
+    hflo = a ? atol(a) : -1; hfhi = b ? atol(b) : -1; }
+  if (hflo >= 0) {
+    if (snes_frame_counter < hflo || (hfhi >= 0 && snes_frame_counter > hfhi)) return;
+  } else {
+    unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+    if (gf < lo || gf > hi) return;
+  }
+  unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+  extern const char *g_last_recomp_func;
+  extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+  uint32_t blk = g_ar_blk_ring[(g_ar_blk_idx - 1u) & 1023u];
+  static int nl; if (nl++ < 4000)
+    fprintf(stderr, "[vramraw] hf=%d gf=%u port=%02x vram=$%04x val=%02x blk=$%06X func=%s\n",
+            snes_frame_counter, gf, port, vaddr, val, blk, g_last_recomp_func ? g_last_recomp_func : "?");
+}
+
+int ar_vramwatch(uint16_t vaddr, uint8_t val) {
+  static int en = -1; static unsigned lo, hi, vlo, vhi;
+  if (en < 0) {
+    en = getenv("AR_VRAMWATCH") ? 1 : 0;
+    const char *l = getenv("AR_VW_LO"), *h = getenv("AR_VW_HI");
+    const char *vl = getenv("AR_VW_VLO"), *vh = getenv("AR_VW_VHI");
+    lo = l ? (unsigned)strtoul(l, NULL, 0) : 0;
+    hi = h ? (unsigned)strtoul(h, NULL, 0) : 0xffffffffu;
+    vlo = vl ? (unsigned)strtoul(vl, NULL, 0) : 0;      /* default all VRAM */
+    vhi = vh ? (unsigned)strtoul(vh, NULL, 0) : 0x7fff;
+  }
+  if (!en) return 0;
+  if (vaddr < vlo || vaddr > vhi) return 0;
+  extern uint8_t g_ram[0x20000];
+  unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+  if (gf < lo || gf > hi) return 0;
+  extern const char *g_last_recomp_func;
+  extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
+  const char *fn = g_last_recomp_func ? g_last_recomp_func : "?";
+  /* Per-FRAME dedup on (fn, vaddr>>5): collapse each frame's burst to a few
+   * lines but show the frame-by-frame timeline (the array clears each frame). */
+  static const void *sf[512]; static unsigned sv[512]; static int n;
+  static unsigned last_gf = 0xffffffffu; static unsigned wr_this_frame;
+  if (gf != last_gf) { last_gf = gf; n = 0; wr_this_frame = 0; }
+  wr_this_frame++;
+  unsigned key = vaddr >> 5;
+  for (int i = 0; i < n; i++) if (sf[i] == fn && sv[i] == key) return 0;
+  if (n < 512) { sf[n] = fn; sv[n] = key; n++; }
+  uint32_t blk = g_ar_blk_ring[(g_ar_blk_idx - 1u) & 1023u];
+  fprintf(stderr, "[vramwatch] gf=%u vram=$%04x val=%02x blk=$%06X func=%s\n",
+          gf, vaddr, val, blk, fn);
+  return 0;
+}

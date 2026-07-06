@@ -577,14 +577,30 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
       return snes->ram[adr]; // ram mirror
     }
     if(adr >= 0x2100 && adr < 0x2200) {
-      return snes_readBBus(snes, adr & 0xff); // B-bus
+      uint8_t v = snes_readBBus(snes, adr & 0xff); // B-bus
+      /* AR_TRACE hwread: APU handshake ports ($2140-$2143) that SPC-upload
+       * loops spin on — the value the branch keyed on. */
+      if (adr >= 0x2140 && adr <= 0x2143) {
+        extern int ar_trace_active(void); extern void ar_trace_hwread(uint16_t, uint8_t);
+        if (ar_trace_active()) ar_trace_hwread(adr, v);
+      }
+      return v;
     }
     if (adr == 0x4016 || adr == 0x4017) {
       // joypad read disabled
+      { extern int ar_trace_active(void); extern void ar_trace_hwread(uint16_t, uint8_t);
+        if (ar_trace_active()) ar_trace_hwread(adr, 0); }
       return 0;
     }
     if(adr >= 0x4200 && adr < 0x4220 || adr >= 0x4218 && adr < 0x4220) {
-      return snes_readReg(snes, adr); // internal registers
+      uint8_t v = snes_readReg(snes, adr); // internal registers
+      /* vblank/NMI/IRQ status ($4210 RDNMI, $4212 HVBJOY) + auto-joypad
+       * ($4218-$421F) — the reads that gate vblank-wait spins and input. */
+      if (adr == 0x4210 || adr == 0x4212 || (adr >= 0x4218 && adr < 0x4220)) {
+        extern int ar_trace_active(void); extern void ar_trace_hwread(uint16_t, uint8_t);
+        if (ar_trace_active()) ar_trace_hwread(adr, v);
+      }
+      return v;
     }
     if(adr >= 0x4300 && adr < 0x4380) {
       return dma_read(snes->dma, adr); // dma registers
@@ -604,6 +620,10 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
  * writes WRAM without going through them. Mirrors cpu_write8's watch
  * bodies (unconditional for AR_WATCH0019, on-change for AR_WATCHOBJ). */
 static inline void snes_write_watch(uint32_t off, uint8_t old_val, uint8_t val) {
+  /* AR_TRACE wram channel — DMA-driven WRAM writes bypass the cpu_write and
+   * IndirWrite paths, so hook them here too (completes "who wrote this WRAM"). */
+  { extern int ar_trace_active(void); extern void ar_trace_wram(uint32_t, uint16_t, uint16_t, int);
+    if (ar_trace_active()) ar_trace_wram(off, old_val, val, 1); }
   if (off == 0x19 && getenv("AR_WATCH0019")) {
     static int n;
     if (n++ < 200) {

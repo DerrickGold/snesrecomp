@@ -175,6 +175,9 @@ static inline uint8_t *IndirPtr(LongPtr ptr, uint16 offs) {
 static inline void IndirWatchByte(uint8_t *dst, uint8_t old_val, uint8_t value) {
   if (dst < g_ram || dst >= g_ram + 0x20000) return;
   uint32_t off = (uint32_t)(dst - g_ram);
+  { extern int ar_trace_active(void);
+    extern void ar_trace_wram(uint32_t, uint16_t, uint16_t, int);
+    if (ar_trace_active()) ar_trace_wram(off, old_val, value, 1); }
   if (getenv("AR_WATCHOBJ")) {
     static long wo = -2;
     if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
@@ -198,7 +201,8 @@ static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
   uint8_t *dst = IndirPtr(ptr, offs);
   uint8_t old_val = 0;
   static int need_old = -1;
-  if (need_old < 0) need_old = getenv("AR_WATCHOBJ") != NULL;
+  if (need_old < 0)
+    need_old = (getenv("AR_WATCHOBJ") != NULL) || (getenv("AR_TRACE") != NULL);
   if (need_old && dst >= g_ram && dst < g_ram + 0x20000) old_val = dst[0];
 #if SNESRECOMP_REVERSE_DEBUG
   // Only fire the WRAM hook if the write actually landed in WRAM.
@@ -221,6 +225,9 @@ static inline void IndirWriteByte(LongPtr ptr, uint16 offs, uint8 value) {
 static inline void IndirWatchWord(uint8_t *dst, uint16_t old_val, uint16_t value) {
   if (dst < g_ram || dst >= g_ram + 0x20000) return;
   uint32_t off = (uint32_t)(dst - g_ram);
+  { extern int ar_trace_active(void);
+    extern void ar_trace_wram(uint32_t, uint16_t, uint16_t, int);
+    if (ar_trace_active()) ar_trace_wram(off, old_val, value, 2); }
   if (getenv("AR_WATCHOBJ")) {
     static long wo = -2;
     if (wo == -2) { const char *e = getenv("AR_WATCHOBJ"); wo = e ? (long)strtoul(e, NULL, 16) : -1; }
@@ -263,7 +270,8 @@ static inline void IndirWriteWord(LongPtr ptr, uint16 offs, uint16 value) {
   uint16_t old_val = 0;
   static int need_old = -1;
   if (need_old < 0)
-    need_old = (getenv("AR_WATCHOBJ") != NULL) || (getenv("AR_WATCH16") != NULL);
+    need_old = (getenv("AR_WATCHOBJ") != NULL) || (getenv("AR_WATCH16") != NULL)
+             || (getenv("AR_TRACE") != NULL);
   if (need_old && dst >= g_ram && dst < g_ram + 0x20000)
     old_val = (uint16_t)dst[0] | ((uint16_t)dst[1] << 8);
 #if SNESRECOMP_REVERSE_DEBUG

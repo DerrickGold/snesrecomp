@@ -479,6 +479,11 @@ void ar_mxhist_dump(void);
 void ar_entry_trapfn(CpuState *cpu, const char *fn, uint32 pc24);
 void ar_garbage_variant_trap(CpuState *cpu, const char *fn, uint32 pc24);
 void ar_adad_trace(CpuState *cpu, const char *fn, uint32 pc24);
+/* Unified runtime trace (ar_trace.c) — declared here so the inline
+ * ar_entry_mx_check func-entry hook can call it without pulling ar_trace.h. */
+int  ar_trace_active(void);
+void ar_trace_func(uint32 pc24, const char *name, int m, int x, int em, int ex);
+void ar_trace_call(uint32 pc24, const char *name, int m, int x, int em, int ex);
 static inline void ar_entry_mx_check(CpuState *cpu, int em, int ex,
                                      const char *fn, uint32 pc24) {
   if (g_ar_mx_check
@@ -489,6 +494,10 @@ static inline void ar_entry_mx_check(CpuState *cpu, int em, int ex,
   if (g_ar_trapfn)
     ar_entry_trapfn(cpu, fn, pc24);
   ar_adad_trace(cpu, fn, pc24);
+  /* Unified AR_TRACE func-entry channel (records runtime + expected m/x, so a
+   * misdecode is visible inline). No-op unless AR_TRACE is set + in window. */
+  if (ar_trace_active())
+    ar_trace_func(pc24, fn, cpu->m_flag & 1, cpu->x_flag & 1, em, ex);
 }
 
 /* ── Exit-side invariant checks (symmetric twins of ar_entry_mx_check) ──
@@ -541,6 +550,11 @@ static inline void ar_call_mx_check(CpuState *cpu, int em, int ex,
   if (g_ar_call_mx_check
       && (((cpu->m_flag & 1) != em) || ((cpu->x_flag & 1) != ex)))
     ar_call_mx_fail(cpu, em, ex, fn, pc24);
+  /* Unified AR_TRACE `call` channel — logs the DECODER-expected (em,ex) vs
+   * runtime m/x at this call site; a mismatch (`leak`) is the m-leak boundary.
+   * This is AR_CALLMX folded into the one-run trace. No-op unless AR_TRACE on. */
+  if (ar_trace_active())
+    ar_trace_call(pc24, fn, cpu->m_flag & 1, cpu->x_flag & 1, em, ex);
 }
 
 /* AR_INDIRLOG (2026-07-01): every `JSR (abs,X)` the decoder severed for

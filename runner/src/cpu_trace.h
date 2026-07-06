@@ -1410,6 +1410,38 @@ static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
    *   $03:93D2 gate1 ($9D9F record-alloc) PASSED; $03:93DB gate2 ($8D18
    *   site-scan) PASSED; $03:9400 gate3 ($8C84 map-write) PASSED = scheduled;
    *   $03:943C/$03:943D abort exits; $03:93C0 candidate-store entry. */
+  /* AR_LAIRDMA=1 (2026-07-05): $02:AF42 DMAs the top tilemap rows from a WRAM
+   * buffer ($D2:$D0) to VRAM ($D3), size $D5-derived. Log the DMA params so the
+   * garbage-source buffer can be found (the lair-seal top-strip corruption). */
+  {
+    static int ld = -1;
+    if (ld < 0) ld = getenv("AR_LAIRDMA") ? 1 : 0;
+    if (ld && pc24 == 0x02AF3Du) {
+      extern int snes_frame_counter; extern uint8 g_ram[0x20000];
+      if (g_ram[0xD5] != 0) {  /* $D5!=0 => DMA will run (BNE $AF42) */
+        static int nl;
+        if (nl < 80) {
+          nl++;
+          unsigned gf = (unsigned)g_ram[0x88] | ((unsigned)g_ram[0x89] << 8);
+          unsigned src = g_ram[0xD0] | (g_ram[0xD1] << 8);
+          unsigned bank = g_ram[0xD2];
+          unsigned dst = g_ram[0xD3] | (g_ram[0xD4] << 8);
+          /* source bytes if bank $7E/$7F (WRAM buffer) */
+          char sb[48] = "(non-WRAM src)";
+          if (bank == 0x7E || bank == 0x7F) {
+            unsigned base = ((bank & 1) << 16) | src;
+            snprintf(sb, sizeof sb, "%02x %02x %02x %02x %02x %02x %02x %02x",
+                     g_ram[base], g_ram[(base+1)&0x1ffff], g_ram[(base+2)&0x1ffff],
+                     g_ram[(base+3)&0x1ffff], g_ram[(base+4)&0x1ffff],
+                     g_ram[(base+5)&0x1ffff], g_ram[(base+6)&0x1ffff], g_ram[(base+7)&0x1ffff]);
+          }
+          fprintf(stderr, "[lairdma] gf=%u f=%d src=$%02x:%04x -> vram=$%04x "
+                  "size$D5=%02x src[0..7]=%s\n", gf, snes_frame_counter, bank, src,
+                  dst, g_ram[0xD5], sb);
+        }
+      }
+    }
+  }
   {
     static int sd_en = -1;
     if (sd_en < 0) sd_en = getenv("AR_SIMDEV") ? 1 : 0;
@@ -1440,6 +1472,31 @@ static inline void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
      * ($8362 COP $9C fires iff census A!=0, else BEQ $8392); $8362 COP fires;
      * $89F7 = the per-frame build-animation tick ($7C97 step, $7CFB active);
      * $8440 = the completion that draws the house + clears $9758,X to $FFFF. */
+    /* AR_SIMWALK=1 (2026-07-04, round 5): the town people (dev walkers + church
+     * cutscene) spawn but their behavior state $0E14 (record+$12) is stuck at 1
+     * so they run the UNPACED handler $01:CD35 (advances walk script every
+     * frame) instead of progressing to state 3 (CEFA, paced walk). CD35 reads a
+     * script byte via CFC7 ($CD41 = the CMP #$7F right after; A = script byte),
+     * then dispatches non-$7F bytes at $CD5E (table $CD6F -> CD93/CDB0/CDCC/CDE8,
+     * which set state=3). Log the script byte + state + record ptr to see what
+     * the actor reads and why it never advances. X = record base during CD35. */
+    static int sw = -1;
+    if (sw < 0) sw = getenv("AR_SIMWALK") ? 1 : 0;
+    if (sw && (pc24 == 0x01CD41u || pc24 == 0x01CD5Eu)) {
+      static int nw;
+      if (nw < 400) {
+        nw++;
+        extern int snes_frame_counter;
+        extern uint8 g_ram[0x20000];
+        uint16 rec = cpu->X;  /* $7E low-RAM record base */
+        uint16 e12 = (uint16)(rec + 0x12), e16 = (uint16)(rec + 0x16);
+        uint16 st = (uint16)g_ram[e12] | ((uint16)g_ram[(uint16)(e12+1)] << 8);
+        uint16 sp = (uint16)g_ram[e16] | ((uint16)g_ram[(uint16)(e16+1)] << 8);
+        fprintf(stderr, "[simwalk] f=%d pc=$%06X %s rec=$%04X scriptByte(A)=$%04X "
+                "state$+12=%04X scriptPtr$+16=%04X\n", snes_frame_counter, pc24,
+                (pc24==0x01CD41u)?"CMP#7F":"DISPATCH", rec, cpu->A, st, sp);
+      }
+    }
     static int sd2 = -1;
     if (sd2 < 0) sd2 = getenv("AR_SIMDEV2") ? 1 : 0;
     if (sd2 && (pc24 == 0x038349u || pc24 == 0x038356u || pc24 == 0x038362u

@@ -1211,6 +1211,19 @@ void cpu_trace_block_watch_check(CpuState *cpu, uint32_t pc24) {
 }
 
 void cpu_trace_block(CpuState *cpu, uint32_t pc24) {
+    /* AR_MTRACE=1: log runtime m/x-flag at key bank_03_8053 PCs, host-frame
+     * gated (AR_HF_LO/HI) — pinpoint where m=1 leaks into $80C9 (VMADD setup). */
+    if (pc24==0x038053||pc24==0x03805E||pc24==0x03806E||pc24==0x038085||
+        pc24==0x0380A1||pc24==0x0380AA||pc24==0x0380C9||pc24==0x038100) {
+      static int en=-1; static long lo,hi; if(en<0){en=getenv("AR_MTRACE")?1:0;
+        const char*a=getenv("AR_HF_LO"),*b=getenv("AR_HF_HI");
+        lo=a?atol(a):-1; hi=b?atol(b):-1;}
+      if(en){ extern int snes_frame_counter;
+        if(lo<0||(snes_frame_counter>=lo&&(hi<0||snes_frame_counter<=hi))){
+          static int nl; if(nl++<80)
+            fprintf(stderr,"[mtrace] hf=%d pc=$%06X m=%d x=%d P=$%02x\n",
+              snes_frame_counter, pc24, cpu->m_flag&1, cpu->x_flag&1, cpu->P); } }
+    }
     /* Investigation: block-boundary DB shadow. Catches EVERY DB change
      * (inline PLBs bypass cpu_trace_db_change), reporting the block where it
      * was first observed + the immediately-preceding block (which did it).
