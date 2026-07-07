@@ -669,6 +669,20 @@ def _emit_bank_one(args_dict: dict) -> dict:
     every per-bank collector list plus drained codegen globals
     (`take_*` results). Main merges these into the global accumulators
     after the pass."""
+    # Enable the dependency-keyed decode memo for the emit path
+    # (2026-07-06). The pool persists across passes, so each worker's
+    # process-local cache survives pass to pass: a function whose
+    # callee_exit_mx deps didn't change since the last pass is a HIT
+    # (provably identical decode — the dep key records the exact
+    # queries + values). Previously the cache was scoped to the
+    # exit-mx autoroute's fixpoint only, so every emit pass re-decoded
+    # every function from scratch. clear=False: never drop entries —
+    # cross-pass reuse is the whole point; memory is bounded by the
+    # graphs a worker has decoded (≤ one pass's worth + churn).
+    # NOTE main-process _phase() still clears the MAIN process's cache
+    # between passes — that's fine (with --jobs>1 main doesn't decode
+    # during emit passes; with --jobs=1 behavior is unchanged).
+    set_decode_cache_enabled(True, clear=False)
     set_rom_size(args_dict['rom_size'])
     set_name_resolver(args_dict['name_map'])
     set_force_variant_at(args_dict['force_variant_at'])
@@ -739,6 +753,11 @@ def _emit_bank_one(args_dict: dict) -> dict:
         'rejected_call_targets': take_rejected_call_targets(),
         'trampoline_returns_local': take_trampoline_returns(),
         'bank_field_warning': bank_field_warning,
+        # Worker-local decode-memo stats (cumulative for this worker
+        # process — the pool persists across passes). Main prints the
+        # per-pass aggregate so a regen shows whether cross-pass decode
+        # reuse is actually happening (hits should climb from pass 1 on).
+        'decode_cache': decode_cache_stats(),
     }
 
 
@@ -1720,6 +1739,15 @@ def main() -> int:
             results = pool.map(_emit_bank_one, work_items)
         else:
             results = [_emit_bank_one(wi) for wi in work_items]
+
+        # Per-pass decode-memo aggregate (worker-cumulative): shows
+        # whether cross-pass decode reuse is working — hit share should
+        # climb sharply from pass 1 once callee_exit_mx stabilizes.
+        _dc_h = sum(r.get('decode_cache', {}).get('hits', 0) for r in results)
+        _dc_m = sum(r.get('decode_cache', {}).get('misses', 0) for r in results)
+        if _dc_h or _dc_m:
+            print(f"  decode-memo (workers, cumulative): {_dc_h}h/{_dc_m}m "
+                  f"({100.0 * _dc_h / max(1, _dc_h + _dc_m):.0f}% hit)")
 
         # Merge worker outputs back into the main process's
         # per-pass + cumulative accumulators.
