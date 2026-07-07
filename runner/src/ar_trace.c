@@ -133,6 +133,10 @@ static void trace_init(void) {
   s_init = 1;
   const char *watch = getenv("AR_TRACE_WATCH");
   const char *path = getenv("AR_TRACE");
+  /* A targeted windowed capture (AR_TRACE=<file>) beats ambient watch mode:
+   * dev-config.ini keeps AR_TRACE_WATCH always-on, and a deliberate env
+   * AR_TRACE for one run must not be silently ignored. */
+  if (path && path[0]) watch = NULL;
   if (watch && watch[0]) {
     /* always-on anomaly-capture mode: s_fp is a memory stream feeding the ring. */
     s_watch = 1;

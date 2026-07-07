@@ -341,6 +341,55 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       extern void ActRaiser_YieldToHost(void);
       extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
       static bool yielding;
+      /* Spin-wedge self-diagnosis (2026-07-06, dump5/6): if the SAME block
+       * reads $4210 thousands of times consecutively, every exit path failed —
+       * print the full gate state ONCE so the dump names which gate refused
+       * (forceNmi/yielding/inNmi) instead of leaving us to reverse-engineer it
+       * from a block ring. Zero cost until a wedge actually happens. */
+      {
+        static uint32_t wedge_blk, wedge_n;
+        uint32_t b = g_ar_blk_ring[(g_ar_blk_idx - 1) & 1023u];
+        if (b == wedge_blk) {
+          if (++wedge_n == 4096) {
+            extern int snes_frame_counter;
+            fprintf(stderr, "[4210-wedge] blk=$%06X f=%d x4096 consecutive reads; "
+                    "forceNmi=%d yielding=%d inNmi=%d nmiAvail=%d\n",
+                    b, snes_frame_counter, snes->forceNmi ? 1 : 0,
+                    yielding ? 1 : 0, snes->inNmi ? 1 : 0,
+                    snes->nmiAvail ? 1 : 0);
+            fflush(stderr);
+          }
+        } else { wedge_blk = b; wedge_n = 1; }
+      }
+      /* Non-yieldable-context escape for whitelisted spins (2026-07-06, the
+       * rock-zap mode-$85 watchdog hang, dump2/dump5). The story-event system
+       * reaches the $01:9284 wait ($9293 spin) from the NMI/interrupt path,
+       * where forceNmi is cleared and yielding is impossible. There the ack
+       * read at $9290 CONSUMES the one-shot inNmi bit, so the $9293 spin reads
+       * bit7=0 forever -> BPL never breaks -> watchdog. Hardware re-arms RDNMI
+       * at the next vblank even inside the handler; we can't advance time from
+       * inside the NMI call. So: in any context where the yield gate below
+       * does not apply, a WHITELISTED spin block fast-exits (bit7=1, no yield)
+       * — the effect's frame pacing degenerates to instant for that stretch,
+       * but the event completes instead of deadlocking. Non-spin reads keep
+       * the existing inNmi-consume semantics. */
+      if (!(snes->forceNmi && !yielding)) {
+        static const uint32_t kSpinBlocksNoYield[] = {
+          0x019293, 0x0192AA, 0x0287F3, 0x029AC4, 0x02BEBF, 0x03B013, 0x03E535,
+        };
+        uint32_t blk_ny = g_ar_blk_ring[(g_ar_blk_idx - 1) & 1023u];
+        for (unsigned i = 0; i < sizeof(kSpinBlocksNoYield) / sizeof(kSpinBlocksNoYield[0]); i++) {
+          if (blk_ny == kSpinBlocksNoYield[i]) {
+            static int warned;
+            if (!warned) { warned = 1;
+              extern int snes_frame_counter;
+              fprintf(stderr, "[4210] non-yieldable-context spin at $%06X f=%d "
+                      "-> fast-exit (bit7=1, unpaced)\n", blk_ny, snes_frame_counter);
+            }
+            return 0x82;
+          }
+        }
+      }
       if (snes->forceNmi && !yielding && !getenv("AR_NO4210YIELD")) {
         /* Frame pacing for inline (non-HLE'd) vblank waits — STATIC WHITELIST
          * model (2026-07-04, replaces two generations of heuristics).

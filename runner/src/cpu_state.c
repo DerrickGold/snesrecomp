@@ -1030,8 +1030,54 @@ static RecompReturn _cpu_dispatch_once(CpuState *cpu, uint32 pc24,
      * runs with host_return_valid=0 so its RTS/RTL re-dispatches on the
      * popped PC rather than host-returning into this dispatch frame. The
      * chain unwinds when a dispatch misses (S restored above) -> NORMAL. */
-    cpu->host_return_valid = 0;
-    return fp(cpu);
+    /* ── Dispatch recursion guard (2026-07-06, the closure-loop enabler) ──
+     * A WRONG `func` registration of a mid-loop construct continuation (the
+     * B8C2 class) turns a benign miss-unwind into one nested re-entry per
+     * record -> C-stack overflow. Cap live dispatches of the SAME target:
+     * past the cap, fall back to exactly what an UNREGISTERED target would do
+     * (S restore + NORMAL unwind) and warn once naming the cfg line to remove.
+     * This makes a bad registration self-healing (old behavior + diagnostic
+     * instead of a crash), which is what lets the static closure loop
+     * (find_rts_webs --suggest) append candidates without a manual shape
+     * check being life-or-death. Legit 65816 code never self-nests 24 deep
+     * through the dispatcher (RECOMP_STACK_DEPTH itself is only 64). */
+    {
+        #define AR_DISP_LIVE_MAX 256
+        #define AR_DISP_RECURSION_CAP 24
+        static uint32 s_disp_live[AR_DISP_LIVE_MAX];
+        static int s_disp_live_top;
+        int live = 0;
+        for (int i = 0; i < s_disp_live_top; i++)
+            if (s_disp_live[i] == pc24) live++;
+        if (live >= AR_DISP_RECURSION_CAP) {
+            static uint32 warned[16]; static int nwarned;
+            int seen = 0;
+            for (int i = 0; i < nwarned; i++) if (warned[i] == pc24) seen = 1;
+            if (!seen) {
+                if (nwarned < 16) warned[nwarned++] = pc24;
+                extern int snes_frame_counter;
+                fprintf(stderr, "[dispatch-recursion] target %06X live x%d — "
+                        "unwinding instead of re-entering (f=%d src=%06X). A cfg "
+                        "`func` at this pc is likely a MID-LOOP construct "
+                        "continuation (B8C2 class) — remove it; see DEBUG.md §1 ⚠️.\n",
+                        pc24, live, snes_frame_counter, source_pc24);
+                fflush(stderr);
+            }
+            { extern int ar_trace_active(void);
+              extern void ar_trace_dispmiss(uint32_t, uint32_t);
+              if (ar_trace_active()) ar_trace_dispmiss(source_pc24, pc24); }
+            cpu->S = entry_s_for_miss_restore;
+            return RECOMP_RETURN_NORMAL;
+        }
+        cpu->host_return_valid = 0;
+        if (s_disp_live_top < AR_DISP_LIVE_MAX) {
+            s_disp_live[s_disp_live_top++] = pc24;
+            RecompReturn _r = fp(cpu);
+            s_disp_live_top--;
+            return _r;
+        }
+        return fp(cpu);   /* tracking saturated — dispatch untracked */
+    }
 }
 
 /* Trampoline driving loop. A dispatched frame that tail-dispatches a computed
