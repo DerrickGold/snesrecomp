@@ -190,6 +190,22 @@ def set_current_site_pc24(pc24: int) -> None:
     _CUR_SITE_PC24 = pc24 & 0xFFFFFF
 
 
+# Labels that correspond to real blocks in the function currently being
+# emitted (emit_function's `local_labels`, pushed per-function like the exit
+# ctx). Lets _emit_indirect_dispatch's ret-continuation decide goto-vs-tailcall
+# by what the DECODER actually created — not by whether the ret pc happens to
+# be a registered func. Both can be true at once: bank_01_B8C2 is a registered
+# func AND its own body loops back through the $B8C0 dispatch, where the ret
+# label IS its local entry — tail-calling there instead of goto-looping nests
+# one C frame per record -> stack overflow (the 2026-07-06 sim-mode crash).
+_CUR_LOCAL_LABELS: frozenset = frozenset()
+
+
+def set_current_local_labels(labels) -> None:
+    global _CUR_LOCAL_LABELS
+    _CUR_LOCAL_LABELS = frozenset(labels)
+
+
 def take_rejected_call_targets() -> set:
     """Return + clear the set of Call targets rejected as out-of-ROM.
     Diagnostic for v2_regen + tests."""
@@ -1477,6 +1493,41 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         ex = 1 if (_sep_mask & 0x10) else (getattr(insn, 'x_flag', 1) & 1)
     suffix = _variant_suffix(em, ex)
 
+    def _ret_transfer() -> List[str]:
+        # The `ret:` continuation of a call-with-return dispatch. If the
+        # decoder created a LOCAL block for it in this function (the normal
+        # case — including a registered func's OWN body looping back through
+        # its dispatch, e.g. bank_01_B8C2's record loop), emit the local goto.
+        # Only when the label does NOT exist locally (the ret pc was carved
+        # out as a separate registered `func`, truncating this function's
+        # decode — the "undeclared label L_B8C2_*" class in OTHER inliners
+        # like bank_01_B898) emit the past-end trampoline tail-call instead:
+        # control continues at the registered function, inheriting this
+        # frame's return obligation. Discriminating by registered-func alone
+        # is WRONG: inside B8C2 itself that tail-called its own entry per
+        # record iteration -> nested C frames -> stack overflow (2026-07-06).
+        ret_lbl = f"L_{_ret16 & 0xFFFF:04X}{suffix}"
+        if not _CUR_LOCAL_LABELS or ret_lbl in _CUR_LOCAL_LABELS:
+            return [f"  goto {ret_lbl};"]
+        ret_pc24 = (site_pc24 & 0xFF0000) | (_ret16 & 0xFFFF)
+        name = get_name_for_pc(ret_pc24)
+        if name is None:
+            # No local block AND not a registered func: emit the goto anyway —
+            # the resulting build error is the honest signal (same as before).
+            return [f"  goto {ret_lbl};"]
+        register_call_demand(ret_pc24, em, ex)
+        T = f"0x{ret_pc24 & 0xFFFFFF:06x}u"
+        return [
+            f"  {{ if (!_hrv) {{ cpu->host_return_valid = _hrv; "
+            f"cpu_tailcall_inherit_return_context(_entry_s, _hrv); "
+            f"cpu_tailcall_request({T}, _entry_s, {T}); "
+            f"RecompStackPop(); return RECOMP_RETURN_TAILCALL; }} "
+            f"RecompStackPop(); "
+            f"return cpu_dispatch_pc_from(cpu, {T}, _entry_s, {T}); }}  "
+            f"/* dispatch-ret tail-call: ${_ret16 & 0xFFFF:04X} is registered "
+            f"func {name}{suffix} */"
+        ]
+
     # Comment marker differentiates JSR (call, fall-through) from
     # JMP/JML (terminator, tail-call) for downstream tooling and
     # regression tests.
@@ -1595,7 +1646,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         lines.append("    default: break;")
         lines.append("  }")
         if is_call_ret:
-            lines.append(f"  goto L_{_ret16 & 0xFFFF:04X}{suffix};")
+            lines.extend(_ret_transfer())
         elif is_jsr:
             lines.append("  /* fall through to post-JSR block */")
         else:
@@ -1690,7 +1741,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
             lines.append("      return RECOMP_RETURN_NORMAL;")
         lines.append("  }")
         if is_call_ret:
-            lines.append(f"  goto L_{_ret16 & 0xFFFF:04X}{suffix};")
+            lines.extend(_ret_transfer())
         elif is_jsr:
             lines.append("  /* fall through to post-JSR block */")
         lines.append("}")
@@ -1822,7 +1873,7 @@ def _emit_indirect_dispatch(insn) -> List[str]:
         # at the in-function continuation. cpu->S is balanced (PHY/PHA pushed 4,
         # the handler's RTS popped the 2-byte return, the PHA's 2 bytes were
         # never materialised — the dispatch consumed them logically).
-        lines.append(f"  goto L_{_ret16 & 0xFFFF:04X}{suffix};")
+        lines.extend(_ret_transfer())
     elif is_jsr:
         # Switch ended; fall through into the next block emitted after
         # this dispatcher (the post-JSR block in the original asm).

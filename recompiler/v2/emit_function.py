@@ -732,6 +732,11 @@ def emit_function(rom: bytes, bank: int, start: int,
     # function. The auto-promote loop in v2_regen ensures that callable
     # function exists in the same emit pass (or a later iteration).
     local_labels = {_label_for(k) for k in block_order}
+    # Push the label set to codegen so _emit_indirect_dispatch's ret-
+    # continuation can decide goto-vs-tailcall by what the decoder actually
+    # created in THIS function (see codegen._CUR_LOCAL_LABELS).
+    from v2.codegen import set_current_local_labels
+    set_current_local_labels(local_labels)
 
     # ── Pre-lower IR for every block ────────────────────────────────────
     # CRITICAL: lower() advances the per-function value-id counter `vf`,
