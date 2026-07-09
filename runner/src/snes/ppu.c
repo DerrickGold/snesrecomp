@@ -1079,9 +1079,12 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
              * crash usually aborts before DumpDiagState, so capture the
              * last-N dispatches feeding into the leak right here. */
             extern void CpuDispatchLogWriteFile(const char *path);
-            CpuDispatchLogWriteFile("saves/crash_dispatch_log.json");
-            fprintf(stderr, "[ppu_read] dispatch ring -> "
-                    "saves/crash_dispatch_log.json\n");
+            const char *rd = getenv("AR_RUN_DIR");  /* per-run dir (run_dir.c) */
+            char dlpath[300];
+            snprintf(dlpath, sizeof dlpath, "%s/crash_dispatch_log.json",
+                     rd && rd[0] ? rd : "saves");
+            CpuDispatchLogWriteFile(dlpath);
+            fprintf(stderr, "[ppu_read] dispatch ring -> %s\n", dlpath);
           }
         }
       }

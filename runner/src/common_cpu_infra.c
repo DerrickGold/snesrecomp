@@ -122,12 +122,17 @@ void ar_mxhist_dump(void) {
   fprintf(stderr, "[mxhist] %d multi-combo PCs\n", n);
   fflush(stderr);
   /* AR_FNCENSUS=1: dump EVERY recorded function-entry PC (not just the
-   * multi-combo ones) with per-(m,x) counts to saves/fn_census.txt. The
+   * multi-combo ones) with per-(m,x) counts to <run-dir>/fn_census.txt. The
    * decisive tool for never-runs bugs: a routine that exists in the binary
    * but is missing from the census was never entered at all -- its trigger
    * upstream never fired (no tripwire can catch code that doesn't run). */
   if (getenv("AR_FNCENSUS")) {
-    FILE *f = fopen("saves/fn_census.txt", "w");
+    /* AR_RUN_DIR = per-run artifact dir exported by the game's run_dir.c. */
+    const char *rd = getenv("AR_RUN_DIR");
+    char census_path[300];
+    snprintf(census_path, sizeof census_path, "%s/fn_census.txt",
+             rd && rd[0] ? rd : "saves");
+    FILE *f = fopen(census_path, "w");
     if (f) {
       unsigned total = 0;
       for (unsigned j = 0; j < MXHIST_CAP; j++) {
@@ -138,7 +143,7 @@ void ar_mxhist_dump(void) {
         total++;
       }
       fclose(f);
-      fprintf(stderr, "[fncensus] wrote saves/fn_census.txt (%u PCs)\n", total);
+      fprintf(stderr, "[fncensus] wrote %s (%u PCs)\n", census_path, total);
     }
   }
 }
