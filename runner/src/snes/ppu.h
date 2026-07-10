@@ -148,6 +148,23 @@ struct Ppu {
   // so a BG3 status bar never tiles into the margins). SMW sets it to the HUD
   // band height so water/level content on BG3 below the bar fills 16:9.
   uint8_t wsBg3WidenY;
+  // Widescreen per-layer clamp (see PpuSetWidescreenLayerClamp). Bit L set =>
+  // BGL+1 (layer L, 0..3) is clamped to the authentic 256-wide region even in
+  // widescreen. For UI/dialog/status layers whose tilemap is only 256 wide, so
+  // they never tile wrapped/garbage columns into the margins while the world
+  // layers beside them stay wide. 0 = every layer extended (default).
+  uint8_t wsLayerClamp;
+  // Per-layer widescreen clamp BAND (see PpuSetWidescreenLayerClampBand): on
+  // scanlines [y0,y1) layer L is clamped to the authentic 256, while it still
+  // extends into the margins outside that band. This is the generic "overlay
+  // plane" ("BG2.5"): a bounded UI element (dialog box, menu panel) sharing a
+  // layer with genuinely-wide world content (pillars) — clamp only the rows the
+  // UI occupies so the world layer stays wide above/below it. y1<=y0 = off.
+  uint8_t wsClampY0[4], wsClampY1[4];
+  // Widescreen margin source gap per layer, in pixels per side (see
+  // PpuSetWidescreenLayerMarginGap): margins skip the first N offscreen
+  // columns (games' UI staging area) and sample the tilemap beyond them.
+  uint8_t wsMarginGapL[4], wsMarginGapR[4];
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
@@ -283,6 +300,34 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
 // level content on BG3 below it (e.g. SMW water) fills 16:9. from_y 0 = off.
 // Like the other widescreen setters, callers re-apply per frame.
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y);
+
+// Per-layer widescreen clamp: bit L (0..3) keeps BG(L+1) in the authentic 256
+// columns even while other layers extend into the margins. For scenes that mix
+// genuinely-wide world layers with 256-wide UI/dialog/status layers (or layers
+// whose offscreen tilemap data is not meant to be shown) — clamp the latter so
+// they never tile wrapped/garbage columns into the border. mask 0 = every layer
+// extended (default). Independent of the BG3-specific widen/split controls; a
+// layer clamped here is clamped regardless of wsBg3WidenY. Re-apply per frame.
+void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
+
+// Clamp BG(layer+1) to the authentic 256 on scanlines [y0,y1) only (the generic
+// "overlay plane" / BG2.5): a bounded UI element sharing a layer with wide world
+// content is confined to the center on its own rows, while the layer stays wide
+// above and below. y1<=y0 disables. Re-apply per frame (the extra-space setters
+// reset it). Independent of the whole-layer clamp and the BG3 widen/split.
+void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                    uint8_t y1);
+
+// Widescreen margin source gap: the margins of BG(layer+1) skip the first
+// left_px/right_px pixels past the authentic screen edges and sample the
+// tilemap beyond them. For games that park UI-construction tiles in the
+// offscreen columns adjacent to the visible screen (a staging area that
+// hardware never shows but widescreen margins would expose) — the gap keeps
+// the staging strip invisible while the layer still fills the margins with
+// its real repeating/world content. Applies to the 4bpp/2bpp BG paths
+// (mosaic lines fall back to ungapped). 0/0 = off. Re-apply per frame.
+void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
+                                    uint8_t right_px);
 
 int PpuGetCurrentRenderScale(Ppu *ppu, uint32_t render_flags);
 
