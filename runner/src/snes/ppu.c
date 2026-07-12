@@ -235,16 +235,21 @@ typedef struct PpuWindows {
 // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
 // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
 static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
-  // Game-forced per-layer clamp (UI/dialog/bounded layers): keep this layer in
-  // the authentic 256 so it never tiles wrapped/garbage columns into the
-  // margins while the wide world layers beside it still extend.
-  if (ppu->wsLayerClamp & (1u << layer))
-    return 0;
-  // Per-layer clamp band: clamp only the rows a bounded UI element occupies, so
-  // wide world content on the same layer stays wide above/below it.
-  if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
-      y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
-    return 0;
+  // Clamp metadata exists only for BG1-BG4. The same window helper is also
+  // used for the color-math window (logical layer 5), which must never index
+  // these four-entry arrays.
+  if (layer < 4) {
+    // Game-forced per-layer clamp (UI/dialog/bounded layers): keep this layer
+    // in the authentic 256 so it never tiles wrapped/garbage columns into the
+    // margins while the wide world layers beside it still extend.
+    if (ppu->wsLayerClamp & (1u << layer))
+      return 0;
+    // Per-layer clamp band: clamp only the rows a bounded UI element occupies,
+    // so wide world content on the same layer stays wide above/below it.
+    if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
+        y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
+      return 0;
+  }
   if (layer != 2)
     return extra;
   return (ppu->wsBg3WidenY && y >= ppu->wsBg3WidenY) ? extra : 0;
