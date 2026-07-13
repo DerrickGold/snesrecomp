@@ -159,6 +159,11 @@ struct Ppu {
   // into the side margins. Used for decorative 256-wide layers that have no
   // real offscreen world data. 0 = disabled.
   uint8_t wsLayerMirror;
+  // Widescreen per-layer repeat fill (see PpuSetWidescreenLayerRepeat). Bit L
+  // keeps BGL+1 authentic in the center, then cyclically continues that
+  // rendered 256px scanline into the margins. Unlike reflection, this keeps
+  // raster/HDMA parallax moving in the same direction across the seam.
+  uint8_t wsLayerRepeat;
   // Per-layer widescreen clamp BAND (see PpuSetWidescreenLayerClampBand): on
   // scanlines [y0,y1) layer L is clamped to the authentic 256, while it still
   // extends into the margins outside that band. This is the generic "overlay
@@ -329,6 +334,15 @@ void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
 // to Mode-1 4bpp BG1/BG2; unsupported layers remain authentically clamped.
 // Re-apply per frame. A mirror bit takes visual precedence over a clamp bit.
 void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
+
+// Repeat-fill BG-layer side margins from the authentic 256-wide rendered
+// result. Left x<0 samples 256+x; right x>=256 samples x-256. Because this is
+// performed independently on each already-rendered scanline, per-line HDMA
+// scroll, transparency, priority, palette animation, and color math remain
+// layer-correct. The current implementation applies to Mode-1 4bpp BG1/BG2;
+// unsupported layers remain authentically clamped. Re-apply per frame. A
+// repeat bit takes precedence if the same layer is also marked for mirroring.
+void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask);
 
 // Clamp BG(layer+1) to the authentic 256 on scanlines [y0,y1) only (the generic
 // "overlay plane" / BG2.5): a bounded UI element sharing a layer with wide world

@@ -61,12 +61,13 @@ void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_fl
   ppu->renderFlags = render_flags;
 }
 
-// Clear the per-frame widescreen layer-policy state (clamp, mirror, and bands).
+// Clear the per-frame widescreen layer-policy state (clamp, padding, bands).
 // The game policy re-applies these every frame after choosing the margin mode,
 // so resetting here keeps stale clamps from a previous frame/mode from leaking.
 static inline void PpuResetLayerClamps(Ppu *ppu) {
   ppu->wsLayerClamp = 0;
   ppu->wsLayerMirror = 0;
+  ppu->wsLayerRepeat = 0;
   memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
   memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
   memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
@@ -135,6 +136,13 @@ void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask) {
   // layers are clamped by PpuLayerExtra so unsupported mirroring cannot expose
   // stale offscreen tilemap data.
   ppu->wsLayerMirror = mask;
+}
+
+void PpuSetWidescreenLayerRepeat(Ppu *ppu, uint8_t mask) {
+  // See ppu.h. This shares the isolated-layer path with mirror padding, but
+  // samples the opposite authentic edge so raster-scrolled art continues in
+  // the same direction instead of reversing at the widescreen boundary.
+  ppu->wsLayerRepeat = mask;
 }
 
 void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
@@ -253,7 +261,8 @@ static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
     // Game-forced per-layer clamp (UI/dialog/bounded layers): keep this layer
     // in the authentic 256 so it never tiles wrapped/garbage columns into the
     // margins while the wide world layers beside it still extend.
-    if ((ppu->wsLayerClamp | ppu->wsLayerMirror) & (1u << layer))
+    if ((ppu->wsLayerClamp | ppu->wsLayerMirror | ppu->wsLayerRepeat) &
+        (1u << layer))
       return 0;
     // Per-layer clamp band: clamp only the rows a bounded UI element occupies,
     // so wide world content on the same layer stays wide above/below it.
@@ -685,14 +694,15 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
 #undef GET_PIXEL_HFLIP
 }
 
-// Composite one isolated 4bpp layer into the live priority buffer, reflecting
-// its authentic rendered edge pixels into the active side margins. Rendering
-// into a temporary layer buffer is important: directly copying the live center
-// would also mirror sprites and lower-priority BGs visible through transparent
-// pixels. Comparing the isolated z/color words reproduces the normal per-layer
-// priority merge for both the authentic center and its reflected margins.
-static void PpuMergeMirroredBackground(Ppu *ppu, bool sub,
-                                        const PpuPixelPrioBufs *layerbuf) {
+// Composite one isolated 4bpp layer into the live priority buffer, padding its
+// active side margins from the authentic rendered scanline. Rendering into a
+// temporary layer buffer is important: directly copying the live center would
+// also duplicate sprites and lower-priority BGs visible through transparent
+// pixels. Comparing isolated z/color words reproduces the normal per-layer
+// priority merge. `repeat` chooses cyclic continuation instead of reflection.
+static void PpuMergePaddedBackground(Ppu *ppu, bool sub,
+                                     const PpuPixelPrioBufs *layerbuf,
+                                     bool repeat) {
   PpuZbufType *dst = ppu->bgBuffers[sub].data;
   const PpuZbufType *src = layerbuf->data;
   for (int x = 0; x < kPpuXPixels; x++) {
@@ -702,14 +712,16 @@ static void PpuMergeMirroredBackground(Ppu *ppu, bool sub,
   }
   for (int x = -(int)ppu->extraLeftCur; x < 0; x++) {
     int di = x + kPpuExtraLeftRight;
-    int si = -x + kPpuExtraLeftRight;
+    int sx = repeat ? kPpuXPixels + x : -x;
+    int si = sx + kPpuExtraLeftRight;
     if (src[si] > dst[di])
       dst[di] = src[si];
   }
   for (int x = kPpuXPixels;
        x < kPpuXPixels + (int)ppu->extraRightCur; x++) {
     int di = x + kPpuExtraLeftRight;
-    int si = (kPpuXPixels * 2 - 2 - x) + kPpuExtraLeftRight;
+    int sx = repeat ? x - kPpuXPixels : kPpuXPixels * 2 - 2 - x;
+    int si = sx + kPpuExtraLeftRight;
     if (src[si] > dst[di])
       dst[di] = src[si];
   }
@@ -718,7 +730,8 @@ static void PpuMergeMirroredBackground(Ppu *ppu, bool sub,
 static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
                                           uint layer, PpuZbufType zhi,
                                           PpuZbufType zlo, bool mosaic) {
-  if (!(ppu->wsLayerMirror & (1u << layer))) {
+  uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
+  if (!(padding & (1u << layer))) {
     if (mosaic)
       PpuDrawBackground_4bpp_mosaic(ppu, &ppu->bgBuffers[sub], y, sub,
                                     layer, zhi, zlo);
@@ -734,7 +747,8 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
     PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
-  PpuMergeMirroredBackground(ppu, sub, &layerbuf);
+  PpuMergePaddedBackground(ppu, sub, &layerbuf,
+                           (ppu->wsLayerRepeat & (1u << layer)) != 0);
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
