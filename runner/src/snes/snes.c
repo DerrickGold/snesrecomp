@@ -342,14 +342,19 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       extern uint32_t g_ar_blk_ring[]; extern unsigned g_ar_blk_idx;
       static bool yielding;
       /* Spin-wedge self-diagnosis (2026-07-06, dump5/6): if the SAME block
-       * reads $4210 thousands of times consecutively, every exit path failed —
+       * reads $4210 thousands of times without another traced block between
+       * reads, every exit path failed —
        * print the full gate state ONCE so the dump names which gate refused
        * (forceNmi/yielding/inNmi) instead of leaving us to reverse-engineer it
-       * from a block ring. Zero cost until a wedge actually happens. */
+       * from a block ring. The block-index adjacency check is essential:
+       * $00:8465 is a legitimate once-per-frame ACK and otherwise accumulates
+       * 4096 same-reader calls across normal gameplay into a false warning. */
       {
         static uint32_t wedge_blk, wedge_n;
+        static unsigned wedge_idx;
+        unsigned idx = g_ar_blk_idx;
         uint32_t b = g_ar_blk_ring[(g_ar_blk_idx - 1) & 1023u];
-        if (b == wedge_blk) {
+        if (b == wedge_blk && (idx == wedge_idx || idx == wedge_idx + 1)) {
           if (++wedge_n == 4096) {
             extern int snes_frame_counter;
             fprintf(stderr, "[4210-wedge] blk=$%06X f=%d x4096 consecutive reads; "
@@ -360,6 +365,7 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
             fflush(stderr);
           }
         } else { wedge_blk = b; wedge_n = 1; }
+        wedge_idx = idx;
       }
       /* Non-yieldable-context escape for whitelisted spins (2026-07-06, the
        * rock-zap mode-$85 watchdog hang, dump2/dump5). The story-event system
@@ -739,4 +745,3 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
   // write to cart
   cart_write(snes->cart, bank, adr, val);
 }
-

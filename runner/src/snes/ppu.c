@@ -37,9 +37,11 @@ void ppu_reset(Ppu* ppu) {
   {
     size_t pitch = ppu->renderPitch;
     uint8_t *renderBuffer = ppu->renderBuffer;
+    uint32_t renderFlags = ppu->renderFlags;
     memset(ppu, 0, sizeof(*ppu));
     ppu->renderBuffer = renderBuffer;
     ppu->renderPitch = (uint32_t)pitch;
+    ppu->renderFlags = renderFlags;
   }
   ppu->vramIncrement = 1;
 }
@@ -56,13 +58,15 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
   ppu->renderPitch = (uint)pitch;
   ppu->renderBuffer = pixels;
+  ppu->renderFlags = render_flags;
 }
 
-// Clear the per-frame widescreen layer-clamp state (whole-layer mask + bands).
+// Clear the per-frame widescreen layer-policy state (clamp, mirror, and bands).
 // The game policy re-applies these every frame after choosing the margin mode,
 // so resetting here keeps stale clamps from a previous frame/mode from leaking.
 static inline void PpuResetLayerClamps(Ppu *ppu) {
   ppu->wsLayerClamp = 0;
+  ppu->wsLayerMirror = 0;
   memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
   memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
   memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
@@ -124,6 +128,13 @@ void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask) {
   // widescreen. See ppu.h. Set per frame by the game's widescreen policy;
   // 0 = all layers extended.
   ppu->wsLayerClamp = mask;
+}
+
+void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask) {
+  // See ppu.h. Only the Mode-1 4bpp paths currently consume these bits; other
+  // layers are clamped by PpuLayerExtra so unsupported mirroring cannot expose
+  // stale offscreen tilemap data.
+  ppu->wsLayerMirror = mask;
 }
 
 void PpuSetWidescreenLayerMarginGap(Ppu *ppu, uint8_t layer, uint8_t left_px,
@@ -242,7 +253,7 @@ static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
     // Game-forced per-layer clamp (UI/dialog/bounded layers): keep this layer
     // in the authentic 256 so it never tiles wrapped/garbage columns into the
     // margins while the wide world layers beside it still extend.
-    if (ppu->wsLayerClamp & (1u << layer))
+    if ((ppu->wsLayerClamp | ppu->wsLayerMirror) & (1u << layer))
       return 0;
     // Per-layer clamp band: clamp only the rows a bounded UI element occupies,
     // so wide world content on the same layer stays wide above/below it.
@@ -382,7 +393,9 @@ static void PpuApplyMarginGap(Ppu *ppu, uint layer, PpuWindows *win, int16 *bias
 }
 
 // Draw a whole line of a 4bpp background layer into bgBuffers
-static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                   uint y, bool sub, uint layer,
+                                   PpuZbufType zhi, PpuZbufType zlo) {
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
   if ((bits & (0x01010101u << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
@@ -413,7 +426,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       continue;  // layer is disabled for this window part
     uint x = win.edges[windex] + ppu->hScroll[layer] + ws_bias[windex];
     uint w = win.edges[windex + 1] - win.edges[windex];
-    PpuZbufType *dstz = ppu->bgBuffers[sub].data + win.edges[windex] + kPpuExtraLeftRight;
+    PpuZbufType *dstz = dstbuf->data + win.edges[windex] + kPpuExtraLeftRight;
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31;
     const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
@@ -610,7 +623,11 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 
 
 // Draw a whole line of a 4bpp background layer into bgBuffers, with mosaic applied
-static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
+                                          PpuPixelPrioBufs *dstbuf, uint y,
+                                          bool sub, uint layer,
+                                          PpuZbufType zhi,
+                                          PpuZbufType zlo) {
 #define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8
 #define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2 | (bits >> 21) & 4 | (bits >> 28) & 8
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | (uint32)addr[8] << 16)
@@ -634,8 +651,8 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu, uint y, bool sub, uint layer
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int sx = win.edges[windex];
-    PpuZbufType *dstz = ppu->bgBuffers[sub].data + sx + kPpuExtraLeftRight;
-    PpuZbufType *dstz_end = ppu->bgBuffers[sub].data + win.edges[windex + 1] + kPpuExtraLeftRight;
+    PpuZbufType *dstz = dstbuf->data + sx + kPpuExtraLeftRight;
+    PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuExtraLeftRight;
     uint x = sx + ppu->hScroll[layer];
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31, *tp_next = tps[(x >> 8 & 1) ^ 1];
@@ -666,6 +683,58 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu, uint y, bool sub, uint layer
 #undef READ_BITS
 #undef GET_PIXEL
 #undef GET_PIXEL_HFLIP
+}
+
+// Composite one isolated 4bpp layer into the live priority buffer, reflecting
+// its authentic rendered edge pixels into the active side margins. Rendering
+// into a temporary layer buffer is important: directly copying the live center
+// would also mirror sprites and lower-priority BGs visible through transparent
+// pixels. Comparing the isolated z/color words reproduces the normal per-layer
+// priority merge for both the authentic center and its reflected margins.
+static void PpuMergeMirroredBackground(Ppu *ppu, bool sub,
+                                        const PpuPixelPrioBufs *layerbuf) {
+  PpuZbufType *dst = ppu->bgBuffers[sub].data;
+  const PpuZbufType *src = layerbuf->data;
+  for (int x = 0; x < kPpuXPixels; x++) {
+    int i = x + kPpuExtraLeftRight;
+    if (src[i] > dst[i])
+      dst[i] = src[i];
+  }
+  for (int x = -(int)ppu->extraLeftCur; x < 0; x++) {
+    int di = x + kPpuExtraLeftRight;
+    int si = -x + kPpuExtraLeftRight;
+    if (src[si] > dst[di])
+      dst[di] = src[si];
+  }
+  for (int x = kPpuXPixels;
+       x < kPpuXPixels + (int)ppu->extraRightCur; x++) {
+    int di = x + kPpuExtraLeftRight;
+    int si = (kPpuXPixels * 2 - 2 - x) + kPpuExtraLeftRight;
+    if (src[si] > dst[di])
+      dst[di] = src[si];
+  }
+}
+
+static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
+                                          uint layer, PpuZbufType zhi,
+                                          PpuZbufType zlo, bool mosaic) {
+  if (!(ppu->wsLayerMirror & (1u << layer))) {
+    if (mosaic)
+      PpuDrawBackground_4bpp_mosaic(ppu, &ppu->bgBuffers[sub], y, sub,
+                                    layer, zhi, zlo);
+    else
+      PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, layer,
+                             zhi, zlo);
+    return;
+  }
+
+  PpuPixelPrioBufs layerbuf;
+  ClearBackdrop(&layerbuf);
+  if (mosaic)
+    PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  else
+    PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
+  PpuMergeMirroredBackground(ppu, sub, &layerbuf);
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
@@ -845,15 +914,13 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
 
     bool mosaic_size = PPU_mosaicSize(ppu) > 1;
-    if (mosaic_size && PPU_mosaicEnabled(ppu, 0))
-      PpuDrawBackground_4bpp_mosaic(ppu, y, sub, 0, 0xc000, 0x8000);
-    else
-      PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x8000);
+    PpuDrawBackground_4bpp_policy(
+        ppu, y, sub, 0, 0xc000, 0x8000,
+        mosaic_size && PPU_mosaicEnabled(ppu, 0));
 
-    if (mosaic_size && PPU_mosaicEnabled(ppu, 1))
-      PpuDrawBackground_4bpp_mosaic(ppu, y, sub, 1, 0xb100, 0x7100);
-    else
-      PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
+    PpuDrawBackground_4bpp_policy(
+        ppu, y, sub, 1, 0xb100, 0x7100,
+        mosaic_size && PPU_mosaicEnabled(ppu, 1));
 
     uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
     if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
@@ -999,9 +1066,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       // gate below clips columns the same way). With extraLeftCur==0 this
       // is the authentic `x > -spriteSize`.
       if(x + spriteSize > -ppu->extraLeftCur) {
-        // break if we found 32 sprites already
+        // break if we found 32 sprites already (hardware cap; lifted by
+        // kPpuRenderFlags_NoSpriteLimits — wide lines carry more sprites and
+        // would hit the authentic cap earlier than a real console's view)
         spritesFound++;
-        if(spritesFound > 32) {
+        if(spritesFound > 32 &&
+           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
           ppu->rangeOver = true;
           break;
         }
@@ -1021,9 +1091,11 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
         for(int col = 0; col < spriteSize; col += 8) {
           if(col + x > -8 - ppu->extraLeftCur && col + x < 256 + ppu->extraRightCur) {
-            // break if we found 34 8*1 slivers already
+            // break if we found 34 8*1 slivers already (hardware cap;
+            // lifted by kPpuRenderFlags_NoSpriteLimits, see the 32-sprite cap)
             tilesFound++;
-            if(tilesFound > 34) {
+            if(tilesFound > 34 &&
+               !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
               ppu->timeOver = true;
               break;
             }
@@ -1048,7 +1120,9 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
           }
         }
-        if(tilesFound > 34) break; // break out of sprite-loop if max tiles found
+        if(tilesFound > 34 &&
+           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
+          break; // break out of sprite-loop if max tiles found
       }
     }
     index += 2;

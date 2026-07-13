@@ -555,14 +555,20 @@ def emit_function(rom: bytes, bank: int, start: int,
             "",
         ])
 
-    # Generic HLE: cfg declared `hle_func <pc> <c_helper>`. Emit a
-    # forwarding stub that hands control to the named C function.
-    # The host runner provides the body (typically in gen_stubs.c).
+    # Generic HLE: cfg declared `hle_func <pc> <c_helper>`. The forwarding
+    # stub is emitted INSTEAD of the decoded body — but the normal
+    # decode+codegen below still runs and its text is discarded at the final
+    # return. Emission is what registers a body's call/goto targets with the
+    # post-emit auto-promote pass, so replacing a function's body must not
+    # orphan callees reachable only through it (ActRaiser $00:923A, reachable
+    # only from the hle'd $00:8C98, silently stopped being emitted and broke
+    # the link). Register-everything-first, THEN substitute the stub.
+    hle_stub_src = None
     if hle_func and (start & 0xFFFF) in hle_func:
         c_helper = hle_func[start & 0xFFFF]
         variant_name = f"{base_func_name}{_variant_suffix(entry_m, entry_x)}"
         pc24 = ((bank & 0xFF) << 16) | (start & 0xFFFF)
-        return "\n".join([
+        hle_stub_src = "\n".join([
             f"RecompReturn {variant_name}(CpuState *cpu) {{",
             "  extern const char *g_last_recomp_func;",
             f"  extern RecompReturn {c_helper}(CpuState *cpu);",
@@ -579,7 +585,8 @@ def emit_function(rom: bytes, bank: int, start: int,
             "",
         ])
 
-    graph = decode_function(rom, bank, start, entry_m, entry_x, end=end,
+    try:
+        graph = decode_function(rom, bank, start, entry_m, entry_x, end=end,
                             dispatch_helpers=dispatch_helpers,
                             indirect_call_tables=indirect_call_tables,
                             indirect_dispatch=indirect_dispatch,
@@ -588,6 +595,13 @@ def emit_function(rom: bytes, bank: int, start: int,
                             callee_exit_mx=callee_exit_mx,
                             callee_exit_mx_modes=callee_exit_mx_modes,
                             sibling_entry_pcs=sibling_entry_pcs)
+    except Exception:
+        # An hle'd body is allowed to be undecodable (that can be exactly why
+        # it was hle'd). Fall back to the stub alone — discovery through this
+        # body is then impossible, matching the pre-fix behavior.
+        if hle_stub_src is not None:
+            return hle_stub_src
+        raise
     # Garbage-variant detection: a split-immediate MISDECODE. If this variant
     # decodes a BRK at a PC that a VALID sibling variant (opposite m or x) spans
     # mid-instruction, the BRK is the high byte of a 16-bit immediate the narrow
@@ -1979,6 +1993,11 @@ def emit_function(rom: bytes, bank: int, start: int,
     src.append("  RecompStackPop();")
     src.append("  return RECOMP_RETURN_NORMAL;")
     src.append("}")
+    # hle_func: the decoded body above ran purely for its emission side
+    # effects (call/goto target registration for auto-promote, metadata);
+    # what lands in the bank source is the forwarding stub.
+    if hle_stub_src is not None:
+        return hle_stub_src
     return "\n".join(src) + "\n"
 
 

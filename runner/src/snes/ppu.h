@@ -154,6 +154,11 @@ struct Ppu {
   // they never tile wrapped/garbage columns into the margins while the world
   // layers beside them stay wide. 0 = every layer extended (default).
   uint8_t wsLayerClamp;
+  // Widescreen per-layer mirror fill (see PpuSetWidescreenLayerMirror). Bit L
+  // keeps BGL+1 authentic in the center, then reflects its rendered edge pixels
+  // into the side margins. Used for decorative 256-wide layers that have no
+  // real offscreen world data. 0 = disabled.
+  uint8_t wsLayerMirror;
   // Per-layer widescreen clamp BAND (see PpuSetWidescreenLayerClampBand): on
   // scanlines [y0,y1) layer L is clamped to the authentic 256, while it still
   // extends into the margins outside that band. This is the generic "overlay
@@ -168,6 +173,11 @@ struct Ppu {
   uint8_t lastMosaicModulo;
   uint8_t lastBrightnessMult;
   bool lineHasSprites;
+  // kPpuRenderFlags_* for this session (PpuBeginDrawing). NoSpriteLimits
+  // lifts the hardware 32-sprites/34-tiles per-scanline caps — on widescreen
+  // lines with more sprites visible, the authentic caps clip sprites EARLIER
+  // than a real console would relative to the wider view.
+  uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
   uint32_t renderPitch;
@@ -309,6 +319,16 @@ void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y);
 // extended (default). Independent of the BG3-specific widen/split controls; a
 // layer clamped here is clamped regardless of wsBg3WidenY. Re-apply per frame.
 void PpuSetWidescreenLayerClamp(Ppu *ppu, uint8_t mask);
+
+// Mirror-fill BG-layer side margins from the authentic 256-wide rendered
+// result. Bit L reflects BG(L+1) without duplicating the boundary pixel:
+// left destination x<0 samples -x, right destination x>=256 samples 510-x.
+// Reflection happens after tile decode/windowing but before layer priority and
+// color math are finalized, so transparency, priority, palette animation, and
+// sub-screen behavior remain layer-correct. The current implementation applies
+// to Mode-1 4bpp BG1/BG2; unsupported layers remain authentically clamped.
+// Re-apply per frame. A mirror bit takes visual precedence over a clamp bit.
+void PpuSetWidescreenLayerMirror(Ppu *ppu, uint8_t mask);
 
 // Clamp BG(layer+1) to the authentic 256 on scanlines [y0,y1) only (the generic
 // "overlay plane" / BG2.5): a bounded UI element sharing a layer with wide world

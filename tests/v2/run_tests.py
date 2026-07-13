@@ -34,6 +34,7 @@ TEST_MODULES = [
     'test_codegen_per_op_smoke',
     'test_emit_function_smoke',
     'test_emit_bank_smoke',
+    'test_split_bank_translation_units',
     'test_cfg_loader',
     'test_v2_emit_lint',
     'test_nlr_idiom',

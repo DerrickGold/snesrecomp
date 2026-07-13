@@ -1,8 +1,8 @@
 """snesrecomp.tools.v2_regen
 
 Drive the v2 pipeline over every bank cfg in a SMW-style repo,
-producing one C file per bank into the single active generated-code
-directory.
+producing one or more C translation units per bank into the single active
+generated-code directory.
 
 Usage:
     python snesrecomp/tools/v2_regen.py --rom smw.sfc \
@@ -12,7 +12,8 @@ Usage:
 For each `bankXX.cfg` under --cfg-dir:
     1. parse via cfg_loader.load_bank_cfg
     2. emit via emit_bank.emit_bank
-    3. write to <out_dir>/bankXX_v2.c  (game-agnostic naming)
+    3. write small banks to <out_dir>/bankXX_v2.c and split large banks into
+       stable <out_dir>/bankXX_partNN_v2.c translation units
 
 Exits 0 if every bank completed; non-zero otherwise. Per-bank failures
 are caught and reported individually so a single bug doesn't block
@@ -93,6 +94,99 @@ def write_if_changed(path, content: str) -> bool:
         pass
     path.write_text(content, encoding='utf-8', newline='\n')
     return True
+
+
+_TOP_LEVEL_CPU_FN_RE = re.compile(
+    r'^(?:RecompReturn|void)\s+([A-Za-z_]\w*)\(CpuState \*cpu\) \{',
+    re.MULTILINE)
+_VARIANT_CALL_NAME_RE = re.compile(
+    r'\b([A-Za-z_]\w*_M[01]X[01])\(cpu\)')
+_VARIANT_SUFFIX_RE = re.compile(r'_M[01]X[01]$')
+_SYNTHETIC_BANK_FN_RE = re.compile(
+    r'^bank_([0-9A-Fa-f]{2})_([0-9A-Fa-f]{4})$')
+_FORWARD_DECL_MARKER = '/* Forward declarations for in-bank entries. */'
+
+
+def _split_bank_translation_units(src: str, bank: int, entry_starts: dict, *,
+                                  threshold_bytes: int,
+                                  pc_span: int) -> dict[str, str]:
+    """Split a large emitted bank into stable entry-address translation units.
+
+    The semantic pipeline continues to consume ``src`` as one monolithic blob;
+    splitting happens only at the final C-file boundary. Functions are assigned
+    by entry PC rather than generated-text size, so editing one body never moves
+    unrelated functions between objects. Each part embeds only the variant
+    declarations its bodies actually reference, avoiding a shared all-symbols
+    header that would invalidate every part after a cfg entry is added.
+    """
+    mono_name = f'bank{bank:02x}_v2.c'
+    if pc_span <= 0 or len(src.encode('utf-8')) < threshold_bytes:
+        return {mono_name: src}
+
+    matches = list(_TOP_LEVEL_CPU_FN_RE.finditer(src))
+    if not matches:
+        return {mono_name: src}
+
+    preamble = src[:matches[0].start()]
+    marker = preamble.find(_FORWARD_DECL_MARKER)
+    if marker < 0:
+        raise ValueError(
+            f'bank ${bank:02X}: emitted source lacks forward-declaration marker')
+    include_preamble = preamble[:marker].rstrip() + '\n\n'
+
+    name_to_pc = entry_starts
+
+    chunks: dict[int, list[str]] = {}
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(src)
+        body = src[match.start():end].strip() + '\n'
+        symbol = match.group(1)
+        base = _VARIANT_SUFFIX_RE.sub('', symbol)
+        pc = name_to_pc.get(base)
+        if pc is None:
+            synthetic = _SYNTHETIC_BANK_FN_RE.match(base)
+            if synthetic and int(synthetic.group(1), 16) == bank:
+                pc = int(synthetic.group(2), 16)
+        if pc is None:
+            raise ValueError(
+                f'bank ${bank:02X}: cannot assign emitted function {symbol!r} '
+                f'to a stable PC chunk')
+        part = max(0, (pc - 0x8000) // pc_span)
+        chunks.setdefault(part, []).append(body)
+
+    outputs: dict[str, str] = {}
+    for part, bodies in sorted(chunks.items()):
+        joined = '\n'.join(bodies)
+        refs = sorted(set(_VARIANT_CALL_NAME_RE.findall(joined)))
+        declarations = ''.join(
+            f'RecompReturn {name}(CpuState *cpu);\n' for name in refs)
+        part_header = (
+            f'/* Split translation unit: bank ${bank:02X}, part {part:02X}; '
+            f'entry PCs ${0x8000 + part * pc_span:04X}-'
+            f'${min(0xFFFF, 0x8000 + (part + 1) * pc_span - 1):04X}. */\n')
+        outputs[f'bank{bank:02x}_part{part:02x}_v2.c'] = (
+            include_preamble + part_header + '\n' + declarations + '\n' +
+            joined.rstrip() + '\n')
+    return outputs
+
+
+def _write_bank_translation_units(out_dir: pathlib.Path, bank: int,
+                                  entry_starts: dict,
+                                  src: str, *, threshold_bytes: int,
+                                  pc_span: int) -> tuple[int, int]:
+    """Content-gated write plus stale monolith/part cleanup for one bank."""
+    outputs = _split_bank_translation_units(
+        src, bank, entry_starts, threshold_bytes=threshold_bytes,
+        pc_span=pc_span)
+    wanted = set(outputs)
+    changed = 0
+    for filename, content in outputs.items():
+        changed += int(write_if_changed(out_dir / filename, content))
+    for old in out_dir.glob(f'bank{bank:02x}*_v2.c'):
+        if old.name not in wanted:
+            old.unlink()
+            changed += 1
+    return len(outputs), changed
 
 
 # Stub-lint markers. Any emitted C line containing one of these strings
@@ -743,6 +837,11 @@ def _emit_bank_one(args_dict: dict) -> dict:
         'bank': bank,
         'status': 'ok',
         'src': src,
+        'entry_starts': {
+            (e.name or f'bank_{bank:02X}_{e.start & 0xFFFF:04X}'):
+                e.start & 0xFFFF
+            for e in cfg.entries
+        },
         'cfg_entries_count': len(cfg.entries),
         'suppressed': bank_suppressed,
         'const_z_folds': bank_const_z_folds,
@@ -816,7 +915,19 @@ def main() -> int:
                         '8C/16T desktop); hyperthreads rarely help '
                         'and compete for execution units.'.format(
                             _default_jobs))
+    p.add_argument('--bank-chunk-threshold-kib', type=int, default=4096,
+                   help='Split emitted banks at or above this generated-C '
+                        'size into stable translation units (default: 4096 '
+                        'KiB). Set to 0 to split every non-empty bank.')
+    p.add_argument('--bank-chunk-pc-span', type=lambda s: int(s, 0),
+                   default=0x0800,
+                   help='Entry-address range assigned to each split bank '
+                        'translation unit (default: 0x800). Set to 0 to '
+                        'disable bank splitting.')
     args = p.parse_args()
+
+    chunk_threshold_bytes = max(0, args.bank_chunk_threshold_kib) * 1024
+    chunk_pc_span = max(0, args.bank_chunk_pc_span)
 
     # ── Phase-tracking + watchdog ───────────────────────────────────
     regen_start_time = time.time()
@@ -1762,8 +1873,10 @@ def main() -> int:
                     print(r['traceback'])
                 failed.append((bank, r['error']))
                 continue
-            out_path = out_dir / f'bank{bank:02x}_v2.c'
-            write_if_changed(out_path, r['src'])
+            part_count, part_changes = _write_bank_translation_units(
+                out_dir, bank, r['entry_starts'], r['src'],
+                threshold_bytes=chunk_threshold_bytes,
+                pc_span=chunk_pc_span)
             all_suppressed.extend(r['suppressed'])
             all_const_z_folds.extend(r['const_z_folds'])
             all_dispatch_suppressed.extend(r['dispatch_suppressed'])
@@ -1775,7 +1888,11 @@ def main() -> int:
             cumulative_trampoline_returns.update(
                 r['trampoline_returns_local'])
             if pass_idx == 0:
-                print(f"  OK    bank ${bank:02X}: {r['cfg_entries_count']} entries -> {out_path}")
+                shape = (f'{part_count} parts' if part_count > 1
+                         else '1 translation unit')
+                print(f"  OK    bank ${bank:02X}: "
+                      f"{r['cfg_entries_count']} entries -> {shape} "
+                      f"({part_changes} file change(s))")
             succeeded += 1
         # Reseed main's _TRAMPOLINE_RETURNS for any later main-process
         # emit paths (none today) and keep main's view consistent.
@@ -2447,6 +2564,9 @@ def main() -> int:
         print("Stubs are a hard build error. Close the recompiler-level "
               "gap that produced each marker; do NOT add an allowlist.")
         return 1
+    # A single mtime sentinel lets incremental build wrappers determine whether
+    # any cfg is newer without depending on a particular bank being monolithic.
+    (out_dir / '.v2_regen_stamp').touch()
     return 0
 
 
