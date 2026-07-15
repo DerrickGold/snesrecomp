@@ -70,6 +70,8 @@ static inline void PpuResetLayerClamps(Ppu *ppu) {
   ppu->wsLayerRepeat = 0;
   memset(ppu->wsClampY0, 0, sizeof(ppu->wsClampY0));
   memset(ppu->wsClampY1, 0, sizeof(ppu->wsClampY1));
+  memset(ppu->wsRepeatY0, 0, sizeof(ppu->wsRepeatY0));
+  memset(ppu->wsRepeatY1, 0, sizeof(ppu->wsRepeatY1));
   memset(ppu->wsMarginGapL, 0, sizeof(ppu->wsMarginGapL));
   memset(ppu->wsMarginGapR, 0, sizeof(ppu->wsMarginGapR));
 }
@@ -164,6 +166,16 @@ void PpuSetWidescreenLayerClampBand(Ppu *ppu, uint8_t layer, uint8_t y0,
   if (layer < 4) {
     ppu->wsClampY0[layer] = y0;
     ppu->wsClampY1[layer] = y1;
+  }
+}
+
+void PpuSetWidescreenLayerRepeatBand(Ppu *ppu, uint8_t layer, uint8_t y0,
+                                     uint8_t y1) {
+  // Repeat BG(layer+1)'s authentic rendered scanline into both margins only on
+  // [y0,y1). The draw policy gives this band precedence over whole-layer clamp.
+  if (layer < 4) {
+    ppu->wsRepeatY0[layer] = y0;
+    ppu->wsRepeatY1[layer] = y1;
   }
 }
 
@@ -268,6 +280,11 @@ static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
     // so wide world content on the same layer stays wide above/below it.
     if (ppu->wsClampY1[layer] > ppu->wsClampY0[layer] &&
         y >= ppu->wsClampY0[layer] && y < ppu->wsClampY1[layer])
+      return 0;
+    // A repeat band is first rendered only in the authentic center, then its
+    // isolated scanline is merged into the margins by the 4bpp policy path.
+    if (ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
+        y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer])
       return 0;
   }
   if (layer != 2)
@@ -731,7 +748,10 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
                                           uint layer, PpuZbufType zhi,
                                           PpuZbufType zlo, bool mosaic) {
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
-  if (!(padding & (1u << layer))) {
+  bool repeat_band = layer < 4 &&
+      ppu->wsRepeatY1[layer] > ppu->wsRepeatY0[layer] &&
+      y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
+  if (!(padding & (1u << layer)) && !repeat_band) {
     if (mosaic)
       PpuDrawBackground_4bpp_mosaic(ppu, &ppu->bgBuffers[sub], y, sub,
                                     layer, zhi, zlo);
@@ -748,6 +768,7 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   PpuMergePaddedBackground(ppu, sub, &layerbuf,
+                           repeat_band ||
                            (ppu->wsLayerRepeat & (1u << layer)) != 0);
 }
 
