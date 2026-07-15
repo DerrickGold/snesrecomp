@@ -142,6 +142,7 @@ struct Ppu {
   uint8_t extraLeftCur, extraRightCur, extraLeftRight, extraBottomCur;
   // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
+  uint8_t wsHudLeftOnlyY;
   // Widescreen BG3 widen (see PpuSetWidescreenBg3Widen). Scanlines >= this let
   // BG3 (layer 2) extend into the side margins like BG1/BG2 instead of staying
   // clamped to the authentic 256-wide region. 0 = off (BG3 clamped everywhere,
@@ -304,15 +305,22 @@ void PpuSetExtraSpaceCentered(Ppu *ppu, uint8_t budget);
 void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 
 // Widescreen HUD split (opt-in, configured by the game frontend): for
-// scanlines < height, BG3 (layer 2) is drawn as three chunks — source
+// scanlines < height, BG3 (layer 2) is drawn as up to three chunks — source
 // [0,left_end) anchored to the LEFT border edge, [left_end,right_start)
 // kept centered (unmoved), [right_start,256) anchored to the RIGHT border
-// edge. The vacated spans stay transparent. height 0 = off (authentic).
-// Only takes effect while extra border columns are active and BG3 is not
-// windowed; mosaic lines fall back to centered. Like the extra-space
-// setters, callers re-apply per frame (ppu_reset zeroes the fields).
+// edge. Set left_end==right_start for a two-way corner layout with no centered
+// chunk. On scanlines [left_only_y,height), the complete source [0,256) is
+// instead anchored to the left presentation edge; set left_only_y >= height
+// to disable that lower band. The vacated spans stay transparent. height 0 =
+// off (authentic).
+// The anchors use the full centering budget, independently of finite-world
+// live side margins; the final compositor uses that same full budget on HUD
+// scanlines while world layers remain bounded. Only takes effect while that
+// border budget is active and BG3 is not shaped by a real window; mosaic lines
+// fall back to centered. Like the extra-space setters, callers re-apply per
+// frame.
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
-                              uint8_t right_start);
+                              uint8_t right_start, uint8_t left_only_y);
 
 // Let BG3 (layer 2) render into the widescreen side margins on scanlines
 // >= from_y, instead of being clamped to the authentic 256-wide region. Pass

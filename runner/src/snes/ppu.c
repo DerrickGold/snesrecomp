@@ -113,13 +113,18 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom) {
 }
 
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
-                              uint8_t right_start) {
-  // See ppu.h. Chunk bounds must be ordered for the span construction in
-  // PpuDrawBackground_2bpp (strictly ascending edges); disable otherwise.
-  if (left_end == 0 || left_end >= right_start) height = 0;
+                              uint8_t right_start, uint8_t left_only_y) {
+  // See ppu.h. Equal bounds select the two-way left/right form; reversed or
+  // empty bounds are invalid and disable the split.
+  if (left_end == 0 || left_end > right_start) height = 0;
+  if (!height)
+    left_only_y = 0;
+  else if (left_only_y > height)
+    left_only_y = height;
   ppu->wsHudSplitHeight = height;
   ppu->wsHudLeftEnd = left_end;
   ppu->wsHudRightStart = right_start;
+  ppu->wsHudLeftOnlyY = left_only_y;
 }
 
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
@@ -266,6 +271,16 @@ typedef struct PpuWindows {
 // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
 // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
 static inline int PpuLayerExtra(Ppu *ppu, uint layer, int y, int extra) {
+  /* A promoted HUD line composites across the complete presentation canvas
+   * even when a finite world's live margin is narrower. Layer 5 is the color
+   * window used by the final compositor; widening only that logical layer does
+   * not grant BG1/BG2 or sprites any additional world visibility. Their
+   * outside-live-margin pixels remain the cleared backdrop, while the BG3 HUD
+   * split below supplies the fixed-screen status pixels. */
+  if (layer == 5 && ppu->wsHudSplitHeight &&
+      y < ppu->wsHudSplitHeight && ppu->extraLeftRight)
+    return ppu->extraLeftRight;
+
   // Clamp metadata exists only for BG1-BG4. The same window helper is also
   // used for the color-math window (logical layer 5), which must never index
   // these four-entry arrays.
@@ -545,19 +560,46 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   // window shape (e.g. the level-start iris) keeps the authentic centered
   // HUD for those frames — split + real windows don't compose.
   int16 ws_bias[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-  if (layer == 2 && y < ppu->wsHudSplitHeight &&
-      ppu->extraLeftCur && ppu->extraRightCur &&
-      win.nr == 1 && win.bits == 0) {
-    win.nr = 5;
-    win.bits = 0x0A;  // spans 1 and 3 are the gaps
-    win.edges[0] = -ppu->extraLeftCur;
-    win.edges[1] = ppu->wsHudLeftEnd - ppu->extraLeftCur;
-    win.edges[2] = ppu->wsHudLeftEnd;
-    win.edges[3] = ppu->wsHudRightStart;
-    win.edges[4] = ppu->wsHudRightStart + ppu->extraRightCur;
-    win.edges[5] = 256 + ppu->extraRightCur;
-    ws_bias[0] = ppu->extraLeftCur;
-    ws_bias[4] = -(int16)ppu->extraRightCur;
+  /* Anchor HUD chunks to the full presentation canvas, not the live world
+   * margins. Finite rooms can temporarily set extraLeftCur/extraRightCur to
+   * zero at a camera edge while the allocated centering budget—and therefore
+   * the physical widescreen border—remains present. A fixed-screen HUD should
+   * continue to occupy that border even when the world underneath it cannot. */
+  int hud_extra = ppu->extraLeftRight;
+  if (layer == 2 && y < ppu->wsHudSplitHeight && hud_extra &&
+      win.nr == 1 && !(win.bits & 1)) {
+    if (ppu->wsHudLeftOnlyY < ppu->wsHudSplitHeight &&
+        y >= ppu->wsHudLeftOnlyY) {
+      /* Lower left-only form: preserve the complete source row as one chunk.
+       * This is useful for status rows whose content crosses an upper band's
+       * left/center boundary (for example a long enemy-health bar). */
+      win.edges[0] = -hud_extra;
+      win.edges[1] = 256 - hud_extra;
+      ws_bias[0] = hud_extra;
+    } else if (ppu->wsHudLeftEnd == ppu->wsHudRightStart) {
+      /* Two-way form: no centered HUD group. Source [0,split) hugs the left
+       * presentation edge and [split,256) hugs the right. */
+      win.nr = 3;
+      win.bits = 0x02;  // span 1 is the vacated center gap
+      win.edges[0] = -hud_extra;
+      win.edges[1] = ppu->wsHudLeftEnd - hud_extra;
+      win.edges[2] = ppu->wsHudRightStart + hud_extra;
+      win.edges[3] = 256 + hud_extra;
+      ws_bias[0] = hud_extra;
+      ws_bias[2] = -(int16)hud_extra;
+    } else {
+      /* Three-way form: retain a centered source chunk between the corners. */
+      win.nr = 5;
+      win.bits = 0x0A;  // spans 1 and 3 are the gaps
+      win.edges[0] = -hud_extra;
+      win.edges[1] = ppu->wsHudLeftEnd - hud_extra;
+      win.edges[2] = ppu->wsHudLeftEnd;
+      win.edges[3] = ppu->wsHudRightStart;
+      win.edges[4] = ppu->wsHudRightStart + hud_extra;
+      win.edges[5] = 256 + hud_extra;
+      ws_bias[0] = hud_extra;
+      ws_bias[4] = -(int16)hud_extra;
+    }
   } else {
     PpuApplyMarginGap(ppu, layer, &win, ws_bias);
   }
@@ -1006,7 +1048,14 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch], *dst_org = dst;
 
-  dst += (ppu->extraLeftRight - ppu->extraLeftCur);
+  /* Normal scanlines cover only the finite world's live side margins. HUD
+   * split lines cover the full presentation budget so their edge-anchored BG3
+   * chunks survive at a level boundary. PpuLayerExtra made the color-window
+   * spans use the matching full interval above. */
+  int composite_left = ppu->extraLeftCur;
+  if (ppu->wsHudSplitHeight && y < ppu->wsHudSplitHeight)
+    composite_left = ppu->extraLeftRight;
+  dst += (ppu->extraLeftRight - composite_left);
 
   uint32 windex = 0;
   do {
