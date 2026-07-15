@@ -143,6 +143,8 @@ struct Ppu {
   // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
   uint8_t wsHudLeftOnlyY;
+  // Optional OAM range promoted into the host HUD overlay. Count 0 = off.
+  uint8_t wsHudOamFirst, wsHudOamCount;
   // Widescreen BG3 widen (see PpuSetWidescreenBg3Widen). Scanlines >= this let
   // BG3 (layer 2) extend into the side margins like BG1/BG2 instead of staying
   // clamped to the authentic 256-wide region. 0 = off (BG3 clamped everywhere,
@@ -191,8 +193,13 @@ struct Ppu {
   uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
+  PpuPixelPrioBufs wsHudBgBuffer;
+  PpuPixelPrioBufs wsHudObjBuffer;
   uint32_t renderPitch;
   uint8_t *renderBuffer;
+  uint32_t wsHudRenderPitch;
+  uint8_t *wsHudBgRenderBuffer;
+  uint8_t *wsHudObjRenderBuffer;
   uint8_t brightnessMult[32 + 31];
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
@@ -281,6 +288,11 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 
+// Bind transparent host-overlay surfaces for promoted HUD BG3 and OAM pixels.
+// Passing NULL surfaces disables extraction and keeps the HUD in renderBuffer.
+void PpuBeginWidescreenHudOverlay(Ppu *ppu, uint8_t *bg_pixels,
+                                  uint8_t *obj_pixels, size_t pitch);
+
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
 // render width becomes 256 + 2*extra. Drives the dormant extraLeftCur/
@@ -321,6 +333,10 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 // frame.
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start, uint8_t left_only_y);
+
+// Promote an exact contiguous OAM slot range into the separately bound HUD
+// object surface. Callers re-apply it per frame after validating the slots.
+void PpuSetWidescreenHudOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 
 // Let BG3 (layer 2) render into the widescreen side margins on scanlines
 // >= from_y, instead of being clamped to the authentic 256-wide region. Pass
