@@ -118,11 +118,12 @@ bool PpuBindMode7OverlaySurface(Ppu *ppu, uint8_t *pixels, size_t pitch,
 
 bool PpuSetMode7Override(Ppu *ppu, const uint32_t *rgba, int width,
                          int height, int canvas_x0, int canvas_y0,
-                         int canvas_x1, int canvas_y1) {
+                         int canvas_x1, int canvas_y1, uint8_t wrap) {
   if (!ppu->m7OverlayBuffer || !rgba || width <= 0 || height <= 0 ||
       canvas_x1 <= canvas_x0 || canvas_y1 <= canvas_y0 ||
       canvas_x0 < 0 || canvas_y0 < 0 || canvas_x1 > 1024 || canvas_y1 > 1024)
     return false;
+  ppu->m7Override.wrap = wrap;
   ppu->m7Override.rgba = rgba;
   ppu->m7Override.width = width;
   ppu->m7Override.height = height;
@@ -1006,6 +1007,8 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu,
 static bool PpuMode7OverrideSample(Ppu *ppu, bool sub, int screen_x, uint y,
                                    uint32 xpos, uint32 ypos, int dx, int dy) {
   const PpuMode7Override *ov = &ppu->m7Override;
+  if (!ov->wrap && (xpos > 0x3ffff || ypos > 0x3ffff))
+    return false; /* wrapped canvas repetition: keep authentic sampling */
   uint32 cx = xpos >> 8 & 0x3ff, cy = ypos >> 8 & 0x3ff;
   if (cx < (uint32)ov->canvasX0 || cx >= (uint32)ov->canvasX1 ||
       cy < (uint32)ov->canvasY0 || cy >= (uint32)ov->canvasY1)
@@ -1039,6 +1042,8 @@ static bool PpuMode7OverrideSample(Ppu *ppu, bool sub, int screen_x, uint y,
                              + (uint32)(dx * i / scale);
       uint32 sample_y = ypos + (uint32)(row_dy * r / scale)
                              + (uint32)(dy * i / scale);
+      if (!ov->wrap && (sample_x > 0x3ffff || sample_y > 0x3ffff))
+        continue;
       uint32 scx = sample_x >> 8 & 0x3ff, scy = sample_y >> 8 & 0x3ff;
       if (scx < (uint32)ov->canvasX0 || scx >= (uint32)ov->canvasX1 ||
           scy < (uint32)ov->canvasY0 || scy >= (uint32)ov->canvasY1)

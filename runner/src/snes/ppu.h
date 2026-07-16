@@ -75,6 +75,12 @@ typedef struct PpuMode7Override {
   const uint32_t *rgba; /* ARGB words, width*height, row-major */
   int width, height;
   int canvasX0, canvasY0, canvasX1, canvasY1; /* canvas px, x1/y1 exclusive */
+  /* 0: substitute only the primary [0,1024) canvas instance — wrapped
+   * repetitions keep the authentic sparse tile sampling (a zoomed-out wrap
+   * renders faint speckle on hardware; solid supersampled copies there
+   * would be a fidelity break). 1: substitute every wrapped instance, for
+   * canvases that genuinely tile. */
+  uint8_t wrap;
 } PpuMode7Override;
 
 typedef struct PpuOverlayCapture {
@@ -371,7 +377,7 @@ bool PpuBindMode7OverlaySurface(Ppu *ppu, uint8_t *pixels, size_t pitch,
 // Texture alpha < 0x80 leaves the authentic canvas pixel in place.
 bool PpuSetMode7Override(Ppu *ppu, const uint32_t *rgba, int width,
                          int height, int canvas_x0, int canvas_y0,
-                         int canvas_x1, int canvas_y1);
+                         int canvas_x1, int canvas_y1, uint8_t wrap);
 
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
