@@ -42,6 +42,9 @@ void ppu_reset(Ppu* ppu) {
     uint32_t renderFlags = ppu->renderFlags;
     uint32_t overlayPitch[kPpuOverlaySource_Count];
     uint8_t *overlayBuffer[kPpuOverlaySource_Count];
+    uint8_t *m7Buffer = ppu->m7OverlayBuffer;
+    uint32_t m7Pitch = ppu->m7OverlayPitch;
+    uint8_t m7Scale = ppu->m7OverlayScale;
     memcpy(overlayPitch, ppu->overlayRenderPitch, sizeof(overlayPitch));
     memcpy(overlayBuffer, ppu->overlayRenderBuffer, sizeof(overlayBuffer));
     memset(ppu, 0, sizeof(*ppu));
@@ -50,6 +53,9 @@ void ppu_reset(Ppu* ppu) {
     ppu->renderFlags = renderFlags;
     memcpy(ppu->overlayRenderPitch, overlayPitch, sizeof(overlayPitch));
     memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
+    ppu->m7OverlayBuffer = m7Buffer;
+    ppu->m7OverlayPitch = m7Pitch;
+    ppu->m7OverlayScale = m7Scale;
   }
   ppu->vramIncrement = 1;
 }
@@ -92,6 +98,39 @@ bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
 
 void PpuClearOverlayCaptures(Ppu *ppu) {
   memset(ppu->overlayCaptures, 0, sizeof(ppu->overlayCaptures));
+  memset(&ppu->m7Override, 0, sizeof(ppu->m7Override));
+}
+
+bool PpuBindMode7OverlaySurface(Ppu *ppu, uint8_t *pixels, size_t pitch,
+                                uint8_t scale) {
+  if (pixels && (scale < 1 || scale > 4 || !pitch ||
+                 pitch % sizeof(uint32_t) != 0 ||
+                 pitch / sizeof(uint32_t) < (size_t)kPpuXPixels * scale ||
+                 pitch / sizeof(uint32_t) > (size_t)kPpuBufWidth * scale))
+    return false;
+  ppu->m7OverlayBuffer = pixels;
+  ppu->m7OverlayPitch = pixels ? (uint32_t)pitch : 0;
+  ppu->m7OverlayScale = pixels ? scale : 0;
+  if (!pixels)
+    memset(&ppu->m7Override, 0, sizeof(ppu->m7Override));
+  return true;
+}
+
+bool PpuSetMode7Override(Ppu *ppu, const uint32_t *rgba, int width,
+                         int height, int canvas_x0, int canvas_y0,
+                         int canvas_x1, int canvas_y1) {
+  if (!ppu->m7OverlayBuffer || !rgba || width <= 0 || height <= 0 ||
+      canvas_x1 <= canvas_x0 || canvas_y1 <= canvas_y0 ||
+      canvas_x0 < 0 || canvas_y0 < 0 || canvas_x1 > 1024 || canvas_y1 > 1024)
+    return false;
+  ppu->m7Override.rgba = rgba;
+  ppu->m7Override.width = width;
+  ppu->m7Override.height = height;
+  ppu->m7Override.canvasX0 = canvas_x0;
+  ppu->m7Override.canvasY0 = canvas_y0;
+  ppu->m7Override.canvasX1 = canvas_x1;
+  ppu->m7Override.canvasY1 = canvas_y1;
+  return true;
 }
 
 bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
@@ -955,6 +994,72 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu,
 
 
 // Assumes it's drawn on an empty backdrop
+/* Mode-7 override sampling for one screen pixel whose canvas position lands
+ * inside the override rectangle. Returns true when the pixel is "removed":
+ * the caller must then skip the authentic tile write (main and subscreen,
+ * preventing a color-math ghost). On the main pass this also renders the
+ * scale x scale texture subsamples into the bound Mode-7 overlay surface,
+ * stepping the live matrix at fractional increments so per-scanline HDMA
+ * warps apply to the substituted art. Subsamples keep their texture alpha
+ * (host blends edges over the authentic frame); removal itself is decided
+ * by the base sample so translucent art fringes never punch holes. */
+static bool PpuMode7OverrideSample(Ppu *ppu, bool sub, int screen_x, uint y,
+                                   uint32 xpos, uint32 ypos, int dx, int dy) {
+  const PpuMode7Override *ov = &ppu->m7Override;
+  uint32 cx = xpos >> 8 & 0x3ff, cy = ypos >> 8 & 0x3ff;
+  if (cx < (uint32)ov->canvasX0 || cx >= (uint32)ov->canvasX1 ||
+      cy < (uint32)ov->canvasY0 || cy >= (uint32)ov->canvasY1)
+    return false;
+  uint32 span_x = (uint32)(ov->canvasX1 - ov->canvasX0) << 8;
+  uint32 span_y = (uint32)(ov->canvasY1 - ov->canvasY0) << 8;
+  uint32 fx = ((cx - (uint32)ov->canvasX0) << 8) | (xpos & 0xff);
+  uint32 fy = ((cy - (uint32)ov->canvasY0) << 8) | (ypos & 0xff);
+  uint32 base = ov->rgba[(size_t)((uint64)fy * ov->height / span_y) *
+                             ov->width +
+                         (uint64)fx * ov->width / span_x];
+  bool remove = (base >> 24) >= 0x80;
+  if (sub || y == 0)
+    return remove;
+
+  int scale = ppu->m7OverlayScale;
+  uint32 pitch = ppu->m7OverlayPitch;
+  int surface_extra = ((int)(pitch / sizeof(uint32)) / scale - kPpuXPixels) / 2;
+  int column = (screen_x + surface_extra) * scale;
+  if (column < 0 || (uint32)(column + scale) > pitch / sizeof(uint32))
+    return remove;
+  int y_flip = PPU_m7yFlip(ppu) ? -1 : 1;
+  int row_dx = y_flip * ppu->m7matrix[1], row_dy = y_flip * ppu->m7matrix[3];
+  int brightness = ppu->inidisp & 0xf;
+
+  for (int r = 0; r < scale; r++) {
+    uint32 *dst = (uint32 *)(ppu->m7OverlayBuffer +
+                             ((size_t)(y - 1) * scale + r) * pitch) + column;
+    for (int i = 0; i < scale; i++) {
+      uint32 sample_x = xpos + (uint32)(row_dx * r / scale)
+                             + (uint32)(dx * i / scale);
+      uint32 sample_y = ypos + (uint32)(row_dy * r / scale)
+                             + (uint32)(dy * i / scale);
+      uint32 scx = sample_x >> 8 & 0x3ff, scy = sample_y >> 8 & 0x3ff;
+      if (scx < (uint32)ov->canvasX0 || scx >= (uint32)ov->canvasX1 ||
+          scy < (uint32)ov->canvasY0 || scy >= (uint32)ov->canvasY1)
+        continue;
+      uint32 sfx = ((scx - (uint32)ov->canvasX0) << 8) | (sample_x & 0xff);
+      uint32 sfy = ((scy - (uint32)ov->canvasY0) << 8) | (sample_y & 0xff);
+      uint32 argb = ov->rgba[(size_t)((uint64)sfy * ov->height / span_y) *
+                                 ov->width +
+                             (uint64)sfx * ov->width / span_x];
+      if (brightness != 15) {
+        uint32 red = ((argb >> 16 & 0xff) * brightness + 7) / 15;
+        uint32 green = ((argb >> 8 & 0xff) * brightness + 7) / 15;
+        uint32 blue = ((argb & 0xff) * brightness + 7) / 15;
+        argb = (argb & 0xff000000u) | red << 16 | green << 8 | blue;
+      }
+      dst[i] = argb;
+    }
+  }
+  return remove;
+}
+
 static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                     uint y, bool sub, PpuZbufType z) {
   int layer = 0;
@@ -1010,6 +1115,23 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
           do dstz[i] = pixel + z; while (++i != w);
         }
       } while (xpos += dx * w, ypos += dy * w, dstz += w, w = PPU_mosaicSize(ppu), dstz_end - dstz != 0);
+    } else if (ppu->m7OverlayBuffer && ppu->m7Override.rgba) {
+      int screen_x = x;
+      do {
+        if ((uint32)(xpos | ypos) > outside_value) {
+          if (!char_fill)
+            continue;
+          tile = 0;
+        } else {
+          tile = ppu->vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+        }
+        if (PpuMode7OverrideSample(ppu, sub, screen_x, y, xpos, ypos,
+                                   (int)dx, (int)dy))
+          continue;
+        uint8 pixel = ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        if (pixel)
+          dstz[0] = pixel + z;
+      } while (xpos += dx, ypos += dy, ++screen_x, ++dstz != dstz_end);
     } else {
       do {
         if ((uint32)(xpos | ypos) > outside_value) {
@@ -1082,6 +1204,12 @@ static void PpuClearOverlayRenderLine(Ppu *ppu, uint y) {
     if (pixels && pitch)
       memset(pixels + (size_t)screen_y * pitch, 0, pitch);
   }
+  if (ppu->m7OverlayBuffer && ppu->m7OverlayPitch)
+    for (int r = 0; r < ppu->m7OverlayScale; r++)
+      memset(ppu->m7OverlayBuffer +
+                 ((size_t)screen_y * ppu->m7OverlayScale + r) *
+                     ppu->m7OverlayPitch,
+             0, ppu->m7OverlayPitch);
 }
 
 static void PpuWriteOverlayRenderLine(Ppu *ppu, PpuOverlaySource source,

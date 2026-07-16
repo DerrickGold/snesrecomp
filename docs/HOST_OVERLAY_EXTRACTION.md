@@ -88,3 +88,20 @@ and a validated four-slot OBJ graphic, then performs its game-specific
 left/center/right composition after SDL has upscaled the world. The resulting
 host image is pixel-identical to the earlier HUD-specific implementation at
 both Match Game and native-output 1x scales.
+
+## Mode-7 canvas-space texture override
+
+`PpuBindMode7OverlaySurface(ppu, pixels, pitch, scale)` binds a persistent
+transparent ARGB surface covering the render frame at `scale` (1-4)
+subsamples per axis. `PpuSetMode7Override(ppu, rgba, w, h, canvas rect)` is
+per-frame game policy (cleared with the captures): main-screen Mode-7 BG1
+pixels whose canvas coordinates fall inside the rectangle sample the given
+texture instead of VRAM tiles — through the live matrix, so rotation, zoom,
+per-scanline HDMA reloads, windows, and field wrap apply to the substituted
+art. Each screen pixel emits scale x scale texture subsamples stepped at
+fractional matrix increments (the same per-line register state, which is
+exactly correct under HDMA). Opaque base samples (alpha >= 0x80) are removed
+from both main and subscreen; translucent fringes stay in the surface for
+the host to blend, and INIDISP master brightness is resolved on the samples.
+The mosaic path renders authentically. ActRaiser's title intro swirl is the
+first consumer.

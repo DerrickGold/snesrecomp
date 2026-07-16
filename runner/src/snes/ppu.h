@@ -65,6 +65,18 @@ enum {
   kPpuOverlayFlag_RemoveFromGame = 1,
 };
 
+/* Mode-7 canvas-space texture override (per-frame game policy, cleared with
+ * the captures). While active, main-screen Mode-7 BG1 pixels whose canvas
+ * coordinates fall inside [canvasX0,canvasX1)x[canvasY0,canvasY1) and whose
+ * texture sample is opaque are removed from the game frame (main+sub) and
+ * rendered instead — through the live matrix, per-scanline HDMA included —
+ * into the bound Mode-7 overlay surface at `scale` subsamples per axis. */
+typedef struct PpuMode7Override {
+  const uint32_t *rgba; /* ARGB words, width*height, row-major */
+  int width, height;
+  int canvasX0, canvasY0, canvasX1, canvasY1; /* canvas px, x1/y1 exclusive */
+} PpuMode7Override;
+
 typedef struct PpuOverlayCapture {
   /* SNES screen coordinates after scroll/window/mosaic processing. X may be
    * negative or exceed 255 when a widescreen margin is active. Endpoints are
@@ -230,6 +242,11 @@ struct Ppu {
   uint8_t *renderBuffer;
   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
+  /* Mode-7 override: persistent scaled surface binding + per-frame policy. */
+  uint8_t *m7OverlayBuffer;
+  uint32_t m7OverlayPitch;
+  uint8_t m7OverlayScale;
+  PpuMode7Override m7Override;
   uint8_t brightnessMult[32 + 31];
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
@@ -339,6 +356,22 @@ bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
 // Select a contiguous OAM slot range for an already configured OBJ capture.
 // The game remains responsible for validating what those slots represent.
 bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
+
+// Bind the persistent Mode-7 override surface: a transparent ARGB buffer
+// covering the full render frame at `scale` (1-4) subsamples per axis, i.e.
+// (256+2*extra)*scale x 224*scale pixels with the given byte pitch. Survives
+// ppu_reset like the other overlay bindings; NULL disables the feature.
+bool PpuBindMode7OverlaySurface(Ppu *ppu, uint8_t *pixels, size_t pitch,
+                                uint8_t scale);
+
+// Per-frame policy (cleared by PpuClearOverlayCaptures): substitute `rgba`
+// (ARGB words, width x height) for the given Mode-7 canvas-pixel rectangle.
+// Sampling runs inside the Mode-7 layer draw, so rotation, zoom, HDMA
+// per-scanline matrix effects, windows, and INIDISP brightness all apply.
+// Texture alpha < 0x80 leaves the authentic canvas pixel in place.
+bool PpuSetMode7Override(Ppu *ppu, const uint32_t *rgba, int width,
+                         int height, int canvas_x0, int canvas_y0,
+                         int canvas_x1, int canvas_y1);
 
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
