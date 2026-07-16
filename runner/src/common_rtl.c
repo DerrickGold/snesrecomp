@@ -414,6 +414,19 @@ void rtl_accumulate_apu_catchup(void) {
   }
 }
 
+/* Game-installable audio observation seams (all optional, NULL by default):
+ *   g_rtl_apu_port_hook    every $2140-$2143 write, CPU thread, APU lock held
+ *                          (observation only — the write still happens)
+ *   g_rtl_spc_upload_hook  after each successful HLE SPC image upload, with
+ *                          the 24-bit ROM source address (the song identity)
+ *   g_rtl_music_mix_hook   inside RtlRenderAudio's locked region after the
+ *                          MSU-1 mix — same contract as msu1_mix
+ * Installed by ActRaiser's music_replacements.c for manifest-driven music
+ * streaming; other games leave them NULL (zero behavior change). */
+void (*g_rtl_apu_port_hook)(uint8_t port, uint8_t val) = NULL;
+void (*g_rtl_spc_upload_hook)(uint32_t src) = NULL;
+void (*g_rtl_music_mix_hook)(int16_t *buf, int frames) = NULL;
+
 void RtlApuWrite(uint16 adr, uint8 val) {
   /* An out-of-range adr here means corrupted state upstream reached a bogus
    * register write (seen during the post-act transition's bad NMI DMA). Don't
@@ -445,6 +458,8 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
   audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
+  if (g_rtl_apu_port_hook)
+    g_rtl_apu_port_hook((uint8_t)(adr & 0x3), val);
   if (getenv("AR_APULOG") && (adr & 0xfc) == 0x40) {
     extern int snes_frame_counter;
     fprintf(stderr, "[apu] f=%d WRITE $21%02x <- %02x  (spc.pc=%04x in=%02x%02x%02x%02x out=%02x%02x%02x%02x)\n",
@@ -772,6 +787,9 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
   g_apu_last_sync_cycles = g_apu_pace_cycles_estimate;
   RtlApuUnlock();
 
+  if (g_rtl_spc_upload_hook)
+    g_rtl_spc_upload_hook(((uint32_t)data_bank << 16) | data_lo);
+
   if (update_cpu_result) {
     cpu->A = (uint16_t)(cpu->A & 0xff00);
     cpu->X = 0;
@@ -871,6 +889,11 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * lock we already hold, which serialises it against MSU register
    * writes on the CPU thread (msu1_read/msu1_write take the same lock). */
   msu1_mix(audio_buffer, samples);
+  /* Manifest-driven music replacement (ActRaiser music_replacements.c):
+   * streams a host file over the (voice-gated) S-DSP mix. Same lock
+   * contract as msu1_mix; NULL for games that don't install it. */
+  if (g_rtl_music_mix_hook)
+    g_rtl_music_mix_hook(audio_buffer, samples);
   RtlApuUnlock();
 }
 

@@ -132,11 +132,23 @@ void dsp_saveload(Dsp *dsp, SaveLoadInfo *sli) {
   sli->func(sli, &dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
 }
 
+/* Voice mute gate for host-side music replacement: when >= 0, voices whose
+ * live srcn is >= the threshold are excluded from the dry mix AND the echo
+ * input (their envelopes/BRR decoding still run, so ungating is seamless).
+ * ActRaiser's driver keeps per-song instruments at srcn 0x0C+ and the shared
+ * SFX bank below, so a threshold of 0x0C silences music but not effects.
+ * -1 (default) = no gating, byte-identical output. Serialised by the APU
+ * lock like every other dsp_cycle caller. */
+int g_dsp_voice_mute_srcn_min = -1;
+
 void dsp_cycle(Dsp* dsp) {
   int totalL = 0;
   int totalR = 0;
   for(int i = 0; i < 8; i++) {
     dsp_cycleChannel(dsp, i);
+    if(g_dsp_voice_mute_srcn_min >= 0 &&
+       dsp->channel[i].srcn >= g_dsp_voice_mute_srcn_min)
+      continue;
     totalL += (dsp->channel[i].sampleOut * dsp->channel[i].volumeL) >> 6;
     totalR += (dsp->channel[i].sampleOut * dsp->channel[i].volumeR) >> 6;
     totalL = totalL < -0x8000 ? -0x8000 : (totalL > 0x7fff ? 0x7fff : totalL); // clamp 16-bit
@@ -212,6 +224,9 @@ static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR) {
   // get echo input
   int inL = 0, inR = 0;
   for(int i = 0; i < 8; i++) {
+    if(g_dsp_voice_mute_srcn_min >= 0 &&
+       dsp->channel[i].srcn >= g_dsp_voice_mute_srcn_min)
+      continue; /* muted music voices must not bleed through the echo */
     if(dsp->channel[i].echoEnable) {
       inL += (dsp->channel[i].sampleOut * dsp->channel[i].volumeL) >> 6;
       inR += (dsp->channel[i].sampleOut * dsp->channel[i].volumeR) >> 6;
