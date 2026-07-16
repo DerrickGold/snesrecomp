@@ -45,6 +45,38 @@ typedef struct PpuPixelPrioBufs {
   PpuZbufType data[kPpuBufWidth];
 } PpuPixelPrioBufs;
 
+/* Renderer-neutral host-overlay extraction. BG source values deliberately
+ * match the PPU layer indices; OBJ is the fifth screen layer. Each source can
+ * own one screen-space capture rectangle and one full-frame ARGB destination
+ * surface. A caller can crop several independently placed graphics from one
+ * captured bounding rectangle after scanout. */
+typedef enum PpuOverlaySource {
+  kPpuOverlaySource_Bg1 = 0,
+  kPpuOverlaySource_Bg2 = 1,
+  kPpuOverlaySource_Bg3 = 2,
+  kPpuOverlaySource_Bg4 = 3,
+  kPpuOverlaySource_Obj = 4,
+  kPpuOverlaySource_Count = 5,
+} PpuOverlaySource;
+
+enum {
+  /* Do not merge captured pixels back into either main or subscreen. The host
+   * can then reinsert them without a duplicate remaining in renderBuffer. */
+  kPpuOverlayFlag_RemoveFromGame = 1,
+};
+
+typedef struct PpuOverlayCapture {
+  /* SNES screen coordinates after scroll/window/mosaic processing. X may be
+   * negative or exceed 255 when a widescreen margin is active. Endpoints are
+   * exclusive. y uses visible output coordinates (0 is the first scanline). */
+  int16_t x0, x1;
+  int16_t y0, y1;
+  uint8_t flags;
+  /* OBJ-only selector. A zero count captures no objects. Games validate any
+   * semantic identity (HUD icon, portrait, etc.) before supplying the range. */
+  uint8_t oamFirst, oamCount;
+} PpuOverlayCapture;
+
 enum {
   kPpuRenderFlags_NewRenderer = 1,
   // Render mode7 upsampled by 4x4
@@ -143,8 +175,6 @@ struct Ppu {
   // Widescreen HUD split (see PpuSetWidescreenHudSplit). 0 height = off.
   uint8_t wsHudSplitHeight, wsHudLeftEnd, wsHudRightStart;
   uint8_t wsHudLeftOnlyY;
-  // Optional OAM range promoted into the host HUD overlay. Count 0 = off.
-  uint8_t wsHudOamFirst, wsHudOamCount;
   // Widescreen BG3 widen (see PpuSetWidescreenBg3Widen). Scanlines >= this let
   // BG3 (layer 2) extend into the side margins like BG1/BG2 instead of staying
   // clamped to the authentic 256-wide region. 0 = off (BG3 clamped everywhere,
@@ -193,13 +223,13 @@ struct Ppu {
   uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
-  PpuPixelPrioBufs wsHudBgBuffer;
-  PpuPixelPrioBufs wsHudObjBuffer;
+  /* Per-source isolated priority pixels for generic host-overlay captures. */
+  PpuPixelPrioBufs overlayBuffers[kPpuOverlaySource_Count];
+  PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];
   uint32_t renderPitch;
   uint8_t *renderBuffer;
-  uint32_t wsHudRenderPitch;
-  uint8_t *wsHudBgRenderBuffer;
-  uint8_t *wsHudObjRenderBuffer;
+  uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
+  uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
   uint8_t brightnessMult[32 + 31];
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
@@ -288,10 +318,27 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 
-// Bind transparent host-overlay surfaces for promoted HUD BG3 and OAM pixels.
-// Passing NULL surfaces disables extraction and keeps the HUD in renderBuffer.
-void PpuBeginWidescreenHudOverlay(Ppu *ppu, uint8_t *bg_pixels,
-                                  uint8_t *obj_pixels, size_t pitch);
+// Clear/bind persistent transparent ARGB host-overlay surfaces. Bindings survive
+// ppu_reset; capture rectangles do not and are configured by game policy each
+// frame. Surfaces are 256-kPpuBufWidth pixels wide and use the same full-frame
+// coordinate system as renderBuffer.
+// Passing NULL disables extraction for that source. Call ClearBindings once
+// after PPU creation so a frontend can explicitly own all optional surfaces.
+void PpuClearOverlayBindings(Ppu *ppu);
+bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
+                           uint8_t *pixels, size_t pitch);
+
+// Clear per-frame capture policy, then configure an arbitrary screen-space
+// rectangle from BG1-BG4 or OBJ. With RemoveFromGame, pixels inside the rect
+// are omitted from both main and subscreen while still exported with palette,
+// transparency, windows, mosaic, and master brightness resolved.
+void PpuClearOverlayCaptures(Ppu *ppu);
+bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
+                          int x, int y, int width, int height, uint8_t flags);
+
+// Select a contiguous OAM slot range for an already configured OBJ capture.
+// The game remains responsible for validating what those slots represent.
+bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 
 // Set the symmetric widescreen border, in pixels per side (clamped to
 // kPpuExtraLeftRight). 0 restores authentic 256-wide rendering. The internal
@@ -333,10 +380,6 @@ void PpuSetExtraSideSpace(Ppu *ppu, int left, int right, int bottom);
 // frame.
 void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
                               uint8_t right_start, uint8_t left_only_y);
-
-// Promote an exact contiguous OAM slot range into the separately bound HUD
-// object surface. Callers re-apply it per frame after validating the slots.
-void PpuSetWidescreenHudOamRange(Ppu *ppu, uint8_t first, uint8_t count);
 
 // Let BG3 (layer 2) render into the widescreen side margins on scanlines
 // >= from_y, instead of being clamped to the authentic 256-wide region. Pass

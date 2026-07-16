@@ -25,7 +25,9 @@ static uint16_t ppu_getVramRemap(Ppu* ppu);
 
 
 Ppu* ppu_init(void) {
-  Ppu* ppu = malloc(sizeof(Ppu));
+  /* ppu_reset preserves host-owned render bindings. Start them deterministically
+   * NULL before the first reset instead of reading indeterminate malloc data. */
+  Ppu* ppu = calloc(1, sizeof(Ppu));
   return ppu;
 }
 
@@ -38,16 +40,16 @@ void ppu_reset(Ppu* ppu) {
     size_t pitch = ppu->renderPitch;
     uint8_t *renderBuffer = ppu->renderBuffer;
     uint32_t renderFlags = ppu->renderFlags;
-    size_t hudPitch = ppu->wsHudRenderPitch;
-    uint8_t *hudBg = ppu->wsHudBgRenderBuffer;
-    uint8_t *hudObj = ppu->wsHudObjRenderBuffer;
+    uint32_t overlayPitch[kPpuOverlaySource_Count];
+    uint8_t *overlayBuffer[kPpuOverlaySource_Count];
+    memcpy(overlayPitch, ppu->overlayRenderPitch, sizeof(overlayPitch));
+    memcpy(overlayBuffer, ppu->overlayRenderBuffer, sizeof(overlayBuffer));
     memset(ppu, 0, sizeof(*ppu));
     ppu->renderBuffer = renderBuffer;
     ppu->renderPitch = (uint32_t)pitch;
     ppu->renderFlags = renderFlags;
-    ppu->wsHudRenderPitch = (uint32_t)hudPitch;
-    ppu->wsHudBgRenderBuffer = hudBg;
-    ppu->wsHudObjRenderBuffer = hudObj;
+    memcpy(ppu->overlayRenderPitch, overlayPitch, sizeof(overlayPitch));
+    memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
   }
   ppu->vramIncrement = 1;
 }
@@ -67,11 +69,64 @@ void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_fl
   ppu->renderFlags = render_flags;
 }
 
-void PpuBeginWidescreenHudOverlay(Ppu *ppu, uint8_t *bg_pixels,
-                                  uint8_t *obj_pixels, size_t pitch) {
-  ppu->wsHudBgRenderBuffer = bg_pixels;
-  ppu->wsHudObjRenderBuffer = obj_pixels;
-  ppu->wsHudRenderPitch = (bg_pixels || obj_pixels) ? (uint32_t)pitch : 0;
+void PpuClearOverlayBindings(Ppu *ppu) {
+  memset(ppu->overlayRenderBuffer, 0, sizeof(ppu->overlayRenderBuffer));
+  memset(ppu->overlayRenderPitch, 0, sizeof(ppu->overlayRenderPitch));
+  PpuClearOverlayCaptures(ppu);
+}
+
+bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
+                           uint8_t *pixels, size_t pitch) {
+  if ((unsigned)source >= kPpuOverlaySource_Count ||
+      (pixels && (!pitch || pitch % sizeof(uint32_t) != 0 ||
+                  pitch / sizeof(uint32_t) < kPpuXPixels ||
+                  pitch / sizeof(uint32_t) > kPpuBufWidth)))
+    return false;
+  ppu->overlayRenderBuffer[source] = pixels;
+  ppu->overlayRenderPitch[source] = pixels ? (uint32_t)pitch : 0;
+  if (!pixels)
+    memset(&ppu->overlayCaptures[source], 0,
+           sizeof(ppu->overlayCaptures[source]));
+  return true;
+}
+
+void PpuClearOverlayCaptures(Ppu *ppu) {
+  memset(ppu->overlayCaptures, 0, sizeof(ppu->overlayCaptures));
+}
+
+bool PpuSetOverlayCapture(Ppu *ppu, PpuOverlaySource source,
+                          int x, int y, int width, int height, uint8_t flags) {
+  if ((unsigned)source >= kPpuOverlaySource_Count || width <= 0 || height <= 0)
+    return false;
+  int64_t requested_x1 = (int64_t)x + width;
+  int64_t requested_y1 = (int64_t)y + height;
+  int x0 = IntMax(x, -kPpuExtraLeftRight);
+  int x1 = requested_x1 < kPpuXPixels + kPpuExtraLeftRight
+      ? (int)requested_x1 : kPpuXPixels + kPpuExtraLeftRight;
+  int y0 = IntMax(y, 0);
+  int y1 = requested_y1 < 240 ? (int)requested_y1 : 240;
+  if (x1 <= x0 || y1 <= y0)
+    return false;
+  PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  capture->x0 = (int16_t)x0;
+  capture->x1 = (int16_t)x1;
+  capture->y0 = (int16_t)y0;
+  capture->y1 = (int16_t)y1;
+  capture->flags = flags & kPpuOverlayFlag_RemoveFromGame;
+  capture->oamFirst = 0;
+  capture->oamCount = 0;
+  return true;
+}
+
+bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count) {
+  PpuOverlayCapture *capture =
+      &ppu->overlayCaptures[kPpuOverlaySource_Obj];
+  if (first >= 128 || !count || count > 128 - first ||
+      capture->x1 <= capture->x0 || capture->y1 <= capture->y0)
+    return false;
+  capture->oamFirst = first;
+  capture->oamCount = count;
+  return true;
 }
 
 // Clear the per-frame widescreen layer-policy state (clamp, padding, bands).
@@ -138,13 +193,6 @@ void PpuSetWidescreenHudSplit(Ppu *ppu, uint8_t height, uint8_t left_end,
   ppu->wsHudLeftEnd = left_end;
   ppu->wsHudRightStart = right_start;
   ppu->wsHudLeftOnlyY = left_only_y;
-  if (!height) ppu->wsHudOamCount = 0;
-}
-
-void PpuSetWidescreenHudOamRange(Ppu *ppu, uint8_t first, uint8_t count) {
-  if (first >= 128 || count > 128 - first) count = 0;
-  ppu->wsHudOamFirst = first;
-  ppu->wsHudOamCount = count;
 }
 
 void PpuSetWidescreenBg3Widen(Ppu *ppu, uint8_t from_y) {
@@ -268,8 +316,9 @@ void ppu_runLine(Ppu* ppu, int line) {
 
     // evaluate sprites
     ClearBackdrop(&ppu->objBuffer);
-    if (ppu->wsHudObjRenderBuffer)
-      memset(&ppu->wsHudObjBuffer, 0, sizeof(ppu->wsHudObjBuffer));
+    if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
+      memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
+             sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
     ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
 
     if (g_new_ppu) {
@@ -557,7 +606,9 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers
-static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+static void PpuDrawBackground_2bpp(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                   uint y, bool sub, uint layer,
+                                   PpuZbufType zhi, PpuZbufType zlo) {
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
@@ -568,10 +619,6 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
-  bool extract_hud = !sub && layer == 2 && ppu->wsHudBgRenderBuffer &&
-                     y < ppu->wsHudSplitHeight;
-  PpuPixelPrioBufs *dstbuf = extract_hud ? &ppu->wsHudBgBuffer
-                                         : &ppu->bgBuffers[sub];
   PpuWindows win;
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer, y) : PpuWindows_Clear(&win, ppu, layer, y);
   // Widescreen HUD split (PpuSetWidescreenHudSplit): on HUD scanlines,
@@ -592,7 +639,8 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
    * the physical widescreen border—remains present. A fixed-screen HUD should
    * continue to occupy that border even when the world underneath it cannot. */
   int hud_extra = ppu->extraLeftRight;
-  if (layer == 2 && y < ppu->wsHudSplitHeight && hud_extra &&
+  if (dstbuf == &ppu->bgBuffers[sub] && layer == 2 &&
+      y < ppu->wsHudSplitHeight && hud_extra &&
       win.nr == 1 && !(win.bits & 1)) {
     if (ppu->wsHudLeftOnlyY < ppu->wsHudSplitHeight &&
         y >= ppu->wsHudLeftOnlyY) {
@@ -785,10 +833,10 @@ static void PpuDrawBackground_4bpp_mosaic(Ppu *ppu,
 // also duplicate sprites and lower-priority BGs visible through transparent
 // pixels. Comparing isolated z/color words reproduces the normal per-layer
 // priority merge. `repeat` chooses cyclic continuation instead of reflection.
-static void PpuMergePaddedBackground(Ppu *ppu, bool sub,
+static void PpuMergePaddedBackground(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
                                      const PpuPixelPrioBufs *layerbuf,
                                      bool repeat) {
-  PpuZbufType *dst = ppu->bgBuffers[sub].data;
+  PpuZbufType *dst = dstbuf->data;
   const PpuZbufType *src = layerbuf->data;
   for (int x = 0; x < kPpuXPixels; x++) {
     int i = x + kPpuExtraLeftRight;
@@ -812,7 +860,9 @@ static void PpuMergePaddedBackground(Ppu *ppu, bool sub,
   }
 }
 
-static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
+static void PpuDrawBackground_4bpp_policy(Ppu *ppu,
+                                          PpuPixelPrioBufs *dstbuf,
+                                          uint y, bool sub,
                                           uint layer, PpuZbufType zhi,
                                           PpuZbufType zlo, bool mosaic) {
   uint8_t padding = ppu->wsLayerMirror | ppu->wsLayerRepeat;
@@ -821,10 +871,10 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
       y >= ppu->wsRepeatY0[layer] && y < ppu->wsRepeatY1[layer];
   if (!(padding & (1u << layer)) && !repeat_band) {
     if (mosaic)
-      PpuDrawBackground_4bpp_mosaic(ppu, &ppu->bgBuffers[sub], y, sub,
+      PpuDrawBackground_4bpp_mosaic(ppu, dstbuf, y, sub,
                                     layer, zhi, zlo);
     else
-      PpuDrawBackground_4bpp(ppu, &ppu->bgBuffers[sub], y, sub, layer,
+      PpuDrawBackground_4bpp(ppu, dstbuf, y, sub, layer,
                              zhi, zlo);
     return;
   }
@@ -835,13 +885,17 @@ static void PpuDrawBackground_4bpp_policy(Ppu *ppu, uint y, bool sub,
     PpuDrawBackground_4bpp_mosaic(ppu, &layerbuf, y, sub, layer, zhi, zlo);
   else
     PpuDrawBackground_4bpp(ppu, &layerbuf, y, sub, layer, zhi, zlo);
-  PpuMergePaddedBackground(ppu, sub, &layerbuf,
+  PpuMergePaddedBackground(ppu, dstbuf, &layerbuf,
                            repeat_band ||
                            (ppu->wsLayerRepeat & (1u << layer)) != 0);
 }
 
 // Draw a whole line of a 2bpp background layer into bgBuffers, with mosaic applied
-static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, int y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu,
+                                          PpuPixelPrioBufs *dstbuf,
+                                          int y, bool sub, uint layer,
+                                          PpuZbufType zhi,
+                                          PpuZbufType zlo) {
 #define GET_PIXEL() pixel = (bits) & 1 | (bits >> 7) & 2
 #define GET_PIXEL_HFLIP() pixel = (bits >> 7) & 1 | (bits >> 14) & 2
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 8) & 0x7fff], addr[0])
@@ -865,8 +919,8 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, int y, bool sub, uint layer,
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int sx = win.edges[windex];
-    PpuZbufType *dstz = ppu->bgBuffers[sub].data + sx + kPpuExtraLeftRight;
-    PpuZbufType *dstz_end = ppu->bgBuffers[sub].data + win.edges[windex + 1] + kPpuExtraLeftRight;
+    PpuZbufType *dstz = dstbuf->data + sx + kPpuExtraLeftRight;
+    PpuZbufType *dstz_end = dstbuf->data + win.edges[windex + 1] + kPpuExtraLeftRight;
     uint x = sx + ppu->hScroll[layer];
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31, *tp_next = tps[(x >> 8 & 1) ^ 1];
@@ -901,7 +955,8 @@ static void PpuDrawBackground_2bpp_mosaic(Ppu *ppu, int y, bool sub, uint layer,
 
 
 // Assumes it's drawn on an empty backdrop
-static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
+static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf,
+                                    uint y, bool sub, PpuZbufType z) {
   int layer = 0;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -929,8 +984,8 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
     int x = win.edges[windex], x2 = win.edges[windex + 1], tile;
-    PpuZbufType *dstz = ppu->bgBuffers[sub].data + x + kPpuExtraLeftRight;
-    PpuZbufType *dstz_end = ppu->bgBuffers[sub].data + x2 + kPpuExtraLeftRight;
+    PpuZbufType *dstz = dstbuf->data + x + kPpuExtraLeftRight;
+    PpuZbufType *dstz_end = dstbuf->data + x2 + kPpuExtraLeftRight;
     uint32 rx = PPU_m7xFlip(ppu) ? 255 - x : x;
     uint32 xpos = m7startX + ppu->m7matrix[0] * rx;
     uint32 ypos = m7startY + ppu->m7matrix[2] * rx;
@@ -996,6 +1051,100 @@ static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
   }
 }
 
+static bool PpuOverlayActiveOnLine(Ppu *ppu, PpuOverlaySource source,
+                                   int screen_y) {
+  if ((unsigned)source >= kPpuOverlaySource_Count ||
+      !ppu->overlayRenderBuffer[source] ||
+      !ppu->overlayRenderPitch[source])
+    return false;
+  const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  return capture->x1 > capture->x0 && capture->y1 > capture->y0 &&
+         screen_y >= capture->y0 && screen_y < capture->y1;
+}
+
+static uint32 PpuOverlayColor(Ppu *ppu, PpuZbufType pixel) {
+  /* Isolated layer buffers may contain the priority-only backdrop marker.
+   * A zero palette index is still transparent for a captured BG/OBJ plane. */
+  if (!(pixel & 0xff)) return 0;
+  uint32 color = ppu->cgram[pixel & 0xff];
+  return 0xff000000u |
+      (uint32)ppu->brightnessMult[color & 0x1f] << 16 |
+      (uint32)ppu->brightnessMult[(color >> 5) & 0x1f] << 8 |
+      ppu->brightnessMult[(color >> 10) & 0x1f];
+}
+
+static void PpuClearOverlayRenderLine(Ppu *ppu, uint y) {
+  if (y == 0) return;
+  int screen_y = (int)y - 1;
+  for (int source = 0; source < kPpuOverlaySource_Count; source++) {
+    uint8_t *pixels = ppu->overlayRenderBuffer[source];
+    uint32_t pitch = ppu->overlayRenderPitch[source];
+    if (pixels && pitch)
+      memset(pixels + (size_t)screen_y * pitch, 0, pitch);
+  }
+}
+
+static void PpuWriteOverlayRenderLine(Ppu *ppu, PpuOverlaySource source,
+                                      uint y) {
+  if (y == 0) return;
+  int screen_y = (int)y - 1;
+  if (!PpuOverlayActiveOnLine(ppu, source, screen_y))
+    return;
+
+  uint32_t pitch = ppu->overlayRenderPitch[source];
+  int width = (int)(pitch / sizeof(uint32));
+  int texture_extra = IntMax((width - kPpuXPixels) / 2, 0);
+  int screen_min = -texture_extra;
+  int screen_max = width - texture_extra;
+  const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  int x0 = IntMax(capture->x0, screen_min);
+  int x1 = IntMin(capture->x1, screen_max);
+  if (x1 <= x0 || x0 + kPpuExtraLeftRight < 0 ||
+      x1 + kPpuExtraLeftRight > kPpuBufWidth)
+    return;
+
+  uint32 *dst = (uint32 *)(ppu->overlayRenderBuffer[source] +
+                            (size_t)screen_y * pitch);
+  const PpuZbufType *src = ppu->overlayBuffers[source].data;
+  for (int x = x0; x < x1; x++)
+    dst[x + texture_extra] =
+        PpuOverlayColor(ppu, src[x + kPpuExtraLeftRight]);
+}
+
+static PpuPixelPrioBufs *PpuBeginBackgroundOverlay(Ppu *ppu, uint y,
+                                                   bool sub, uint layer) {
+  int screen_y = (int)y - 1;
+  PpuOverlaySource source = (PpuOverlaySource)layer;
+  if (!PpuOverlayActiveOnLine(ppu, source, screen_y))
+    return &ppu->bgBuffers[sub];
+  memset(&ppu->overlayBuffers[source], 0,
+         sizeof(ppu->overlayBuffers[source]));
+  return &ppu->overlayBuffers[source];
+}
+
+static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
+                                       uint layer,
+                                       PpuPixelPrioBufs *layerbuf) {
+  PpuOverlaySource source = (PpuOverlaySource)layer;
+  if (layerbuf != &ppu->overlayBuffers[source])
+    return;
+
+  if (!sub)
+    PpuWriteOverlayRenderLine(ppu, source, y);
+
+  const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+  PpuZbufType *dst = ppu->bgBuffers[sub].data;
+  const PpuZbufType *src = layerbuf->data;
+  bool remove = (capture->flags & kPpuOverlayFlag_RemoveFromGame) != 0;
+  for (int i = 0; i < kPpuBufWidth; i++) {
+    int x = i - kPpuExtraLeftRight;
+    if (remove && x >= capture->x0 && x < capture->x1)
+      continue;
+    if (src[i] > dst[i])
+      dst[i] = src[i];
+  }
+}
+
 static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   // Top 4 bits contain the prio level, and bottom 4 bits the layer type.
   // SPRITE_PRIO_TO_PRIO can be used to convert from obj prio to this prio.
@@ -1017,83 +1166,41 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       PpuDrawSprites(ppu, y, sub, true);
 
     bool mosaic_size = PPU_mosaicSize(ppu) > 1;
+    PpuPixelPrioBufs *layerbuf =
+        PpuBeginBackgroundOverlay(ppu, y, sub, 0);
     PpuDrawBackground_4bpp_policy(
-        ppu, y, sub, 0, 0xc000, 0x8000,
+        ppu, layerbuf, y, sub, 0, 0xc000, 0x8000,
         mosaic_size && PPU_mosaicEnabled(ppu, 0));
+    PpuFinishBackgroundOverlay(ppu, y, sub, 0, layerbuf);
 
+    layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 1);
     PpuDrawBackground_4bpp_policy(
-        ppu, y, sub, 1, 0xb100, 0x7100,
+        ppu, layerbuf, y, sub, 1, 0xb100, 0x7100,
         mosaic_size && PPU_mosaicEnabled(ppu, 1));
+    PpuFinishBackgroundOverlay(ppu, y, sub, 1, layerbuf);
 
     uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
-    bool extract_hud = ppu->wsHudBgRenderBuffer &&
-                       y < ppu->wsHudSplitHeight;
-    if (extract_hud && sub) {
-      /* The promoted HUD is composited by the host after the world; omit its
-       * subscreen copy so it cannot affect world color math underneath. */
-    } else if (extract_hud) {
-      /* The HUD overlay uses the exact non-mosaic tile sampler. ActRaiser's
-       * status band does not enable mosaic; this also keeps extraction in one
-       * well-defined path if a transitional register value says otherwise. */
-      PpuDrawBackground_2bpp(ppu, y, sub, 2, bg3prio, 0x1200);
-    } else if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
-      PpuDrawBackground_2bpp_mosaic(ppu, y, sub, 2, bg3prio, 0x1200);
+    layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 2);
+    if (mosaic_size && PPU_mosaicEnabled(ppu, 2))
+      PpuDrawBackground_2bpp_mosaic(ppu, layerbuf, y, sub, 2,
+                                    bg3prio, 0x1200);
     else
-      PpuDrawBackground_2bpp(ppu, y, sub, 2, bg3prio, 0x1200);
+      PpuDrawBackground_2bpp(ppu, layerbuf, y, sub, 2,
+                             bg3prio, 0x1200);
+    PpuFinishBackgroundOverlay(ppu, y, sub, 2, layerbuf);
   } else {
     // mode 7
-    PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
+    PpuPixelPrioBufs *layerbuf =
+        PpuBeginBackgroundOverlay(ppu, y, sub, 0);
+    PpuDrawBackground_mode7(ppu, layerbuf, y, sub, 0x5000);
+    PpuFinishBackgroundOverlay(ppu, y, sub, 0, layerbuf);
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, false);
   }
 }
 
-static void PpuClearHudRenderLine(Ppu *ppu, uint y) {
-  if (!ppu->wsHudRenderPitch || y == 0) return;
-  if (ppu->wsHudBgRenderBuffer)
-    memset(ppu->wsHudBgRenderBuffer + (y - 1) * ppu->wsHudRenderPitch, 0,
-           ppu->wsHudRenderPitch);
-  if (ppu->wsHudObjRenderBuffer)
-    memset(ppu->wsHudObjRenderBuffer + (y - 1) * ppu->wsHudRenderPitch, 0,
-           ppu->wsHudRenderPitch);
-}
-
-static uint32 PpuHudOverlayColor(Ppu *ppu, PpuZbufType pixel) {
-  if (!pixel) return 0;
-  uint32 color = ppu->cgram[pixel & 0xff];
-  return 0xff000000u |
-      (uint32)ppu->brightnessMult[color & 0x1f] << 16 |
-      (uint32)ppu->brightnessMult[(color >> 5) & 0x1f] << 8 |
-      ppu->brightnessMult[(color >> 10) & 0x1f];
-}
-
-static void PpuWriteHudRenderLine(Ppu *ppu, uint y) {
-  if (!ppu->wsHudRenderPitch || y == 0 || y >= ppu->wsHudSplitHeight)
-    return;
-  int width = (int)(ppu->wsHudRenderPitch / sizeof(uint32));
-  int texture_extra = IntMax((width - 256) / 2, 0);
-  int priority_start = kPpuExtraLeftRight - texture_extra;
-  if (priority_start < 0 || priority_start + width > kPpuBufWidth)
-    return;
-
-  uint32 *bg = ppu->wsHudBgRenderBuffer
-      ? (uint32 *)(ppu->wsHudBgRenderBuffer +
-                   (y - 1) * ppu->wsHudRenderPitch) : NULL;
-  uint32 *obj = ppu->wsHudObjRenderBuffer
-      ? (uint32 *)(ppu->wsHudObjRenderBuffer +
-                   (y - 1) * ppu->wsHudRenderPitch) : NULL;
-  for (int x = 0; x < width; x++) {
-    if (bg)
-      bg[x] = PpuHudOverlayColor(
-          ppu, ppu->wsHudBgBuffer.data[priority_start + x]);
-    if (obj)
-      obj[x] = PpuHudOverlayColor(
-          ppu, ppu->wsHudObjBuffer.data[priority_start + x]);
-  }
-}
-
 static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
-  PpuClearHudRenderLine(ppu, y);
+  PpuClearOverlayRenderLine(ppu, y);
   if (PPU_forcedBlank(ppu)) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
     size_t n = sizeof(uint32) * (256 + ppu->extraLeftRight * 2);
@@ -1103,8 +1210,6 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   // Default background is backdrop
   ClearBackdrop(&ppu->bgBuffers[0]);
-  if (ppu->wsHudBgRenderBuffer)
-    memset(&ppu->wsHudBgBuffer, 0, sizeof(ppu->wsHudBgBuffer));
 
   // Render main screen
   PpuDrawBackgrounds(ppu, y, false);
@@ -1194,7 +1299,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
 
-  PpuWriteHudRenderLine(ppu, y);
+  PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
 
 }
 
@@ -1277,21 +1382,36 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
             int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
             int slot = index >> 1;
-            bool promote_hud = ppu->wsHudObjRenderBuffer &&
-                ppu->wsHudOamCount && slot >= ppu->wsHudOamFirst &&
-                slot < ppu->wsHudOamFirst + ppu->wsHudOamCount;
-            PpuPixelPrioBufs *objbuf = promote_hud ? &ppu->wsHudObjBuffer
-                                                   : &ppu->objBuffer;
-            PpuZbufType *dst = objbuf->data + col + x + px_left +
-                               kPpuExtraLeftRight;
+            PpuOverlayCapture *obj_capture =
+                &ppu->overlayCaptures[kPpuOverlaySource_Obj];
+            bool capture_slot = PpuOverlayActiveOnLine(
+                ppu, kPpuOverlaySource_Obj, line) &&
+                obj_capture->oamCount && slot >= obj_capture->oamFirst &&
+                slot < obj_capture->oamFirst + obj_capture->oamCount;
 
-            for (int px = px_left; px < px_right; px++, dst++) {
+            for (int px = px_left; px < px_right; px++) {
               int shift = oam1 & 0x4000 ? px : 7 - px;
               uint32 bits = plane >> shift;
               int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8;
-              // draw it in the buffer if there is a pixel here, and the buffer there is still empty
-              if (pixel != 0 && (dst[0] & 0xff) == 0)
-                dst[0] = z + pixel;
+              if (pixel != 0) {
+                int screen_x = col + x + px;
+                int di = screen_x + kPpuExtraLeftRight;
+                bool capture_pixel = capture_slot &&
+                    screen_x >= obj_capture->x0 &&
+                    screen_x < obj_capture->x1;
+                if (capture_pixel) {
+                  PpuZbufType *overlay =
+                      &ppu->overlayBuffers[kPpuOverlaySource_Obj].data[di];
+                  if ((*overlay & 0xff) == 0)
+                    *overlay = z + pixel;
+                }
+                if (!capture_pixel ||
+                    !(obj_capture->flags & kPpuOverlayFlag_RemoveFromGame)) {
+                  PpuZbufType *world = &ppu->objBuffer.data[di];
+                  if ((*world & 0xff) == 0)
+                    *world = z + pixel;
+                }
+              }
             }
 
           }
