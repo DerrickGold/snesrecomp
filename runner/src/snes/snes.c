@@ -116,11 +116,23 @@ void snes_catchupApu(Snes* snes) {
   int catchupCycles = (int) snes->apuCatchupCycles;
   if (catchupCycles < 0) catchupCycles = 0;
 
+  /* AR_APUPROF frame attribution (see common_rtl.c). */
+  extern int ApuProfEnabled(void);
+  extern uint64_t audio_trace_wall_ns(void);
+  extern uint64_t g_apuprof_catchup_ns, g_apuprof_catchup_cyc;
+  extern uint32_t g_apuprof_catchup_calls;
+  uint64_t prof_t0 = ApuProfEnabled() ? audio_trace_wall_ns() : 0;
+
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
   for(int i = 0; i < catchupCycles; i++) {
     apu_cycle(snes->apu);
   }
   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+  if (prof_t0) {
+    g_apuprof_catchup_ns += audio_trace_wall_ns() - prof_t0;
+    g_apuprof_catchup_cyc += (uint64_t)catchupCycles;
+    g_apuprof_catchup_calls++;
+  }
   snes->apuCatchupCycles -= (double) catchupCycles;
   if (snes->apuCatchupCycles < 0.0) snes->apuCatchupCycles = 0.0;
   s_catchup_calls++;
@@ -145,6 +157,8 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     RtlApuLock();
     rtl_accumulate_apu_catchup();
     snes_catchupApu(snes);
+    { extern int ApuProfEnabled(void); extern uint32_t g_apuprof_port_reads;
+      if (ApuProfEnabled()) g_apuprof_port_reads++; }
     /* AR_SPC_SPINFIX=1 (opt-in): resident-uploader deadlock breaker — the
      * boss-music-load fix. ActRaiser's sound engine has its own IPL-style
      * uploader resident in ARAM at $0F0E: it raises the $AABB "ready"

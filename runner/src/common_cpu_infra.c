@@ -993,8 +993,13 @@ void WatchdogFrameStart(void) {
   g_tailcall_context_valid = 0;
 }
 
+/* Monotonic loop-header count — an execution-volume proxy for AR_APUPROF
+ * (straight-line loops push nothing, so push counts under-report them). */
+uint64_t g_watchdog_loop_headers;
+
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
+  g_watchdog_loop_headers++;
   if (!g_watchdog_enabled) return;
   // Only check clock() every 10000 iterations to avoid overhead
   if (++g_watchdog_counter < 10000) return;

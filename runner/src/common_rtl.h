@@ -327,6 +327,11 @@ enum {
 void RtlSaveLoad(int cmd, int slot);
 void RtlApuLock();
 void RtlApuUnlock();
+/* Set/query the actual host-device rate used by RtlRenderAudio. The runner's
+ * S-DSP always produces at 32.04 kHz; this rate controls only the final
+ * resampling boundary and therefore must never change emulated pitch. */
+void RtlSetAudioOutputRate(int hz);
+int RtlGetAudioOutputRate(void);
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels);
 bool RtlUploadSpcImageFromDp(CpuState *cpu);
 bool RtlRunFrame(uint32 inputs);

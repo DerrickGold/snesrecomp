@@ -26,7 +26,7 @@ extern void RtlApuLock(void);
 extern void RtlApuUnlock(void);
 
 #define MSU1_RATE            44100
-#define MSU1_FRAMES_PER_BLK  (MSU1_RATE / 60)   /* 735, locked to the 60 Hz block clock */
+#define MSU1_MAX_MIX_FRAMES  65536
 #define MSU1_PCM_HEADER      8                  /* "MSU1" + uint32 loop point */
 #define MSU1_REVISION        0x01
 #define MSU1_PATH_MAX        1024
@@ -55,6 +55,7 @@ static struct {
     bool   audio_error;  /* last track select missing/invalid */
     uint8_t volume;      /* 0..255 linear */
     uint16_t track_lo;   /* latched low byte of $2004, committed on $2005 */
+    double audio_src_carry; /* fractional 44.1 kHz frames across callbacks */
 
     /* Data channel */
     FILE  *data;         /* <base>.msu, opened lazily */
@@ -212,6 +213,7 @@ static void msu_load_track(uint16_t track) {
     msu_close_track();
     g.playing = false;
     g.audio_error = false;
+    g.audio_src_carry = 0.0;
 
     char fn[MSU1_PATH_MAX + 32];
     snprintf(fn, sizeof(fn), "%s-%u.pcm", g.base, (unsigned)track);
@@ -339,25 +341,34 @@ static inline int16_t clamp_s16(int v) {
     return (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
 }
 
-void msu1_mix(int16_t *out, int out_frames) {
-    if (!msu1_enabled() || !g.playing || !g.track || out_frames <= 0)
+void msu1_mix(int16_t *out, int out_frames, int output_rate) {
+    if (!msu1_enabled() || !g.playing || !g.track || out_frames <= 0 ||
+        output_rate <= 0)
         return;
 
-    int16_t src[MSU1_FRAMES_PER_BLK * 2];
-    msu_read_frames(src, MSU1_FRAMES_PER_BLK);
+    double exact = ((double)out_frames * MSU1_RATE / output_rate) +
+                   g.audio_src_carry;
+    int src_frames = (int)exact;
+    g.audio_src_carry = exact - src_frames;
+    if (src_frames <= 0) return;
+    if (src_frames > MSU1_MAX_MIX_FRAMES)
+        src_frames = MSU1_MAX_MIX_FRAMES;
+
+    static int16_t src[MSU1_MAX_MIX_FRAMES * 2];
+    msu_read_frames(src, src_frames);
 
     if (g.volume == 0)
         return;  /* still advanced the cursor above; just don't mix */
 
     const int vol = g.volume;  /* 0..255, linear */
-    const double step = (double)MSU1_FRAMES_PER_BLK / (double)out_frames;
+    const double step = (double)src_frames / (double)out_frames;
     double pos = 0.0;
     for (int i = 0; i < out_frames; i++) {
         int idx = (int)pos;
         double frac = pos - idx;
         int idx1 = idx + 1;
-        if (idx  > MSU1_FRAMES_PER_BLK - 1) idx  = MSU1_FRAMES_PER_BLK - 1;
-        if (idx1 > MSU1_FRAMES_PER_BLK - 1) idx1 = MSU1_FRAMES_PER_BLK - 1;
+        if (idx  > src_frames - 1) idx  = src_frames - 1;
+        if (idx1 > src_frames - 1) idx1 = src_frames - 1;
 
         for (int ch = 0; ch < 2; ch++) {
             int s0 = src[idx * 2 + ch];

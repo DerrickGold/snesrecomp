@@ -56,6 +56,10 @@ void ppu_reset(Ppu* ppu) {
     ppu->m7OverlayBuffer = m7Buffer;
     ppu->m7OverlayPitch = m7Pitch;
     ppu->m7OverlayScale = m7Scale;
+    /* Surviving surfaces may hold pre-reset content; force one full clear. */
+    for (int i = 0; i < kPpuOverlaySource_Count; i++)
+      ppu->overlayRenderMaybeDirty[i] = ppu->overlayRenderBuffer[i] != NULL;
+    ppu->m7OverlayMaybeDirty = ppu->m7OverlayBuffer != NULL;
   }
   ppu->vramIncrement = 1;
 }
@@ -90,6 +94,8 @@ bool PpuBindOverlaySurface(Ppu *ppu, PpuOverlaySource source,
     return false;
   ppu->overlayRenderBuffer[source] = pixels;
   ppu->overlayRenderPitch[source] = pixels ? (uint32_t)pitch : 0;
+  /* A newly bound buffer's contents are unknown; force one full clear. */
+  ppu->overlayRenderMaybeDirty[source] = pixels != NULL;
   if (!pixels)
     memset(&ppu->overlayCaptures[source], 0,
            sizeof(ppu->overlayCaptures[source]));
@@ -111,6 +117,8 @@ bool PpuBindMode7OverlaySurface(Ppu *ppu, uint8_t *pixels, size_t pitch,
   ppu->m7OverlayBuffer = pixels;
   ppu->m7OverlayPitch = pixels ? (uint32_t)pitch : 0;
   ppu->m7OverlayScale = pixels ? scale : 0;
+  /* A newly bound buffer's contents are unknown; force one full clear. */
+  ppu->m7OverlayMaybeDirty = pixels != NULL;
   if (!pixels)
     memset(&ppu->m7Override, 0, sizeof(ppu->m7Override));
   return true;
@@ -1200,21 +1208,40 @@ static uint32 PpuOverlayColor(Ppu *ppu, PpuZbufType pixel) {
       ppu->brightnessMult[(color >> 10) & 0x1f];
 }
 
+/* Captures are per-frame game policy fixed before scanout, so a surface whose
+ * capture is inactive receives no writes this frame. Skip its per-line clear
+ * when it is already all-transparent (the usual case); a surface written last
+ * frame is cleared for one more full frame, then its dirty flag drops on the
+ * final line. */
 static void PpuClearOverlayRenderLine(Ppu *ppu, uint y) {
   if (y == 0) return;
   int screen_y = (int)y - 1;
+  bool last_line = screen_y == 223;
   for (int source = 0; source < kPpuOverlaySource_Count; source++) {
     uint8_t *pixels = ppu->overlayRenderBuffer[source];
     uint32_t pitch = ppu->overlayRenderPitch[source];
-    if (pixels && pitch)
-      memset(pixels + (size_t)screen_y * pitch, 0, pitch);
+    if (!pixels || !pitch)
+      continue;
+    const PpuOverlayCapture *capture = &ppu->overlayCaptures[source];
+    bool active = capture->x1 > capture->x0 && capture->y1 > capture->y0;
+    if (!active && !ppu->overlayRenderMaybeDirty[source])
+      continue;
+    memset(pixels + (size_t)screen_y * pitch, 0, pitch);
+    if (last_line)
+      ppu->overlayRenderMaybeDirty[source] = active;
   }
-  if (ppu->m7OverlayBuffer && ppu->m7OverlayPitch)
-    for (int r = 0; r < ppu->m7OverlayScale; r++)
-      memset(ppu->m7OverlayBuffer +
-                 ((size_t)screen_y * ppu->m7OverlayScale + r) *
-                     ppu->m7OverlayPitch,
-             0, ppu->m7OverlayPitch);
+  if (ppu->m7OverlayBuffer && ppu->m7OverlayPitch) {
+    bool active = ppu->m7Override.rgba != NULL;
+    if (active || ppu->m7OverlayMaybeDirty) {
+      for (int r = 0; r < ppu->m7OverlayScale; r++)
+        memset(ppu->m7OverlayBuffer +
+                   ((size_t)screen_y * ppu->m7OverlayScale + r) *
+                       ppu->m7OverlayPitch,
+               0, ppu->m7OverlayPitch);
+      if (last_line)
+        ppu->m7OverlayMaybeDirty = active;
+    }
+  }
 }
 
 static void PpuWriteOverlayRenderLine(Ppu *ppu, PpuOverlaySource source,

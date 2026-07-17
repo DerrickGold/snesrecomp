@@ -50,15 +50,14 @@ void msu1_set_rom_path(const char *rom_path);
 uint8_t msu1_read(uint16_t reg);
 void    msu1_write(uint16_t reg, uint8_t val);
 
-/* Mix one ~1/60 s audio block of MSU PCM into `out` (int16 interleaved
- * L/R, `out_frames` sample-pairs, already filled with the S-DSP block).
- * Consumes 44100/60 = 735 source frames and resamples to out_frames, so
- * it stays locked to the same 60 Hz block clock as dsp_getSamples and
- * adapts to any host output rate.
+/* Mix one host callback of MSU PCM into `out` (int16 interleaved L/R,
+ * `out_frames` sample-pairs, already filled with the S-DSP block). Source
+ * consumption is derived from `output_rate`, so callback size and cadence do
+ * not alter pitch.
  *
  * MUST be called with the APU lock already held — it is invoked only from
  * inside RtlRenderAudio's locked region. No-op when disabled / not
  * playing. */
-void msu1_mix(int16_t *out, int out_frames);
+void msu1_mix(int16_t *out, int out_frames, int output_rate);
 
 #endif /* SNESRECOMP_MSU1_H */

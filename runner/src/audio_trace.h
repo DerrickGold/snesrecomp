@@ -11,16 +11,16 @@
  *                   samples dropped at the dsp->sampleBuffer cap are
  *                   still visible here.
  *   2. Event ring — every DSP register write (KON/KOF/pitch/volume/...),
- *                   overflow-drop runs, and consume (dsp_getSamples)
- *                   events, all timestamped in native-sample time.
+ *                   overflow-drop runs, and FIFO-consume events, all
+ *                   timestamped in native-sample time.
  *   3. Counters   — produced/dropped/consumed totals, producer
  *                   attribution (CPU-thread catch-up vs audio-thread
  *                   top-up), output-ring occupancy high-water, and a
  *                   once-per-second snapshot ring for rate analysis.
  *
  * All record hooks run under RtlApuLock (dsp_cycle / dsp_write /
- * dsp_getSamples are only reached with the APU lock held), so plain
- * fields suffice. Dump/query entry points take RtlApuLock themselves.
+ * DSP sample-consumption paths are only reached with the APU lock held), so
+ * plain fields suffice. Dump/query entry points take RtlApuLock themselves.
  */
 
 #include <stdint.h>
@@ -93,7 +93,7 @@ typedef struct AudioTraceStats {
   uint64_t dropped;           /* total samples lost to ring overflow    */
   uint64_t drop_runs;         /* number of distinct drop bursts         */
   uint64_t consumed;          /* total native samples read for output   */
-  uint64_t consume_calls;     /* dsp_getSamples calls (audio callbacks) */
+  uint64_t consume_calls;     /* native FIFO consumption chunks         */
   uint64_t reg_writes;        /* DSP register writes                    */
   uint64_t kon_writes;        /* writes to $4C (KON)                    */
   uint32_t occupancy_highwater;

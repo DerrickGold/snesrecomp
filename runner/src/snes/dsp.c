@@ -668,3 +668,36 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame) {
   dsp->sampleRead += 534;
   audio_trace_on_consume(base, 534, dsp->sampleWrite - dsp->sampleRead);
 }
+
+void dsp_getSamplesResampled(Dsp* dsp, int16_t* sampleData,
+                             int samplesPerFrame, double native_step,
+                             double *phase) {
+  if (samplesPerFrame <= 0 || native_step <= 0.0 || !phase)
+    return;
+
+  /* sampleRead remains the integer FIFO cursor; phase carries the fractional
+   * position between callbacks. This makes callback size and callback cadence
+   * irrelevant to playback speed. Linear interpolation is sufficient here:
+   * the S-DSP is already band-limited to its native ~32 kHz output. */
+  double location = *phase;
+  uint32_t base = dsp->sampleRead;
+  for (int i = 0; i < samplesPerFrame; i++) {
+    uint32_t whole = (uint32_t)location;
+    double frac = location - (double)whole;
+    uint32_t idx0 = (base + whole) & (DSP_SAMPLE_RING - 1);
+    uint32_t idx1 = (idx0 + 1) & (DSP_SAMPLE_RING - 1);
+    for (int ch = 0; ch < 2; ch++) {
+      int s0 = dsp->sampleBuffer[idx0 * 2 + ch];
+      int s1 = dsp->sampleBuffer[idx1 * 2 + ch];
+      sampleData[i * 2 + ch] =
+          (int16_t)(s0 + (int)((s1 - s0) * frac));
+    }
+    location += native_step;
+  }
+
+  uint32_t consumed = (uint32_t)location;
+  dsp->sampleRead += consumed;
+  *phase = location - (double)consumed;
+  audio_trace_on_consume(base, consumed,
+                         dsp->sampleWrite - dsp->sampleRead);
+}

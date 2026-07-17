@@ -16,8 +16,9 @@ typedef struct Apu Apu;
 // Output-sample ring capacity (stereo pairs). Must be a power of two so
 // the monotonic write/read counters can index with a mask and survive
 // uint32 wraparound. 8192 samples ≈ 256 ms at 32 kHz — far larger than
-// any single-frame APU catch-up burst, while typical fill stays ~534
-// (one block), so playback latency is unchanged. See the sampleBuffer
+// any single-frame APU catch-up burst, while typical fill stays near one
+// callback's native-time requirement, so playback latency is unchanged. See
+// the sampleBuffer
 // comment in struct Dsp and the music-tick post-mortem in MMX ISSUES.md.
 #define DSP_SAMPLE_RING 8192
 
@@ -110,6 +111,13 @@ void dsp_cycle(Dsp* dsp);
 uint8_t dsp_read(Dsp* dsp, uint8_t adr);
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val);
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame);
+/* Continuously resample the native DSP FIFO. `native_step` is native samples
+ * per output frame and `phase` is retained across calls. The caller must make
+ * sure the FIFO covers both the advanced cursor and the second interpolation
+ * sample at the final output position. */
+void dsp_getSamplesResampled(Dsp* dsp, int16_t* sampleData,
+                             int samplesPerFrame, double native_step,
+                             double *phase);
 void dsp_saveload(Dsp *dsp, SaveLoadInfo *sli);
 
 #endif

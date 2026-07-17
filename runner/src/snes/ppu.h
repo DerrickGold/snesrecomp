@@ -248,6 +248,13 @@ struct Ppu {
   uint8_t *renderBuffer;
   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
+  /* Overlay surfaces are cleared lazily: a surface whose capture is inactive
+   * and whose flag here is clear is already all-transparent, so its
+   * per-scanline clear can be skipped (the common case — captures are rare).
+   * Set when a frame ends with the capture active (content was written) and
+   * on (re)bind, since a caller-provided buffer's contents are unknown. */
+  uint8_t overlayRenderMaybeDirty[kPpuOverlaySource_Count];
+  uint8_t m7OverlayMaybeDirty;
   /* Mode-7 override: persistent scaled surface binding + per-frame policy. */
   uint8_t *m7OverlayBuffer;
   uint32_t m7OverlayPitch;

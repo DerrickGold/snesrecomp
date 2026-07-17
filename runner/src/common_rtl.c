@@ -22,6 +22,14 @@ Ppu *g_ppu;
 Dma *g_dma;
 uint8 g_snesrecomp_last_hdmaen;
 
+/* Host audio is a presentation concern. The S-DSP's native FIFO always runs
+ * at 534 samples/frame * 60 frames/s = 32.04 kHz. Keep a fractional native
+ * cursor so changing SDL frequency or callback size cannot change pitch. */
+#define RTL_DSP_NATIVE_RATE 32040.0
+#define RTL_AUDIO_RESAMPLE_CHUNK 1024
+static int s_audio_output_rate = 44100;
+static double s_dsp_resample_phase;
+
 // Main-CPU cycle estimate, incremented per RDB_BLOCK_HOOK in debug_on_block_enter.
 // Used to pace APU catchup realistically: real SNES is ~3.58 MHz main / ~1.024 MHz APU,
 // ratio ~3.5:1. Prior code hardcoded apuCatchupCycles=32 per APU port touch regardless
@@ -45,6 +53,48 @@ uint64_t g_main_cpu_cycles_estimate = 0;
 // for >5 s and trips the per-frame watchdog (measured, 2026-06-09).
 uint64_t g_apu_pace_cycles_estimate = 0;
 uint64_t g_apu_last_sync_cycles = 0;
+
+/* ---- AR_APUPROF: per-frame APU-stall profiler (diagnostic only) --------
+ * The main loop zeroes these before each game frame and prints one line
+ * when the frame exceeds the report threshold, attributing the time to
+ * lock waits / SPC catch-up / port-handshake spins / HLE uploads / the
+ * music-replacement port hook. All counters are game-thread except
+ * lockwait, which the game-thread RtlApuLock wrapper alone accumulates. */
+int g_apuprof = -1;
+uint64_t g_apuprof_lockwait_ns;
+uint64_t g_apuprof_catchup_ns;
+uint64_t g_apuprof_catchup_cyc;
+uint32_t g_apuprof_catchup_calls;
+uint32_t g_apuprof_port_reads, g_apuprof_port_writes;
+uint64_t g_apuprof_hook_ns;
+uint64_t g_apuprof_upload_ns;
+uint64_t g_apuprof_sched_lat_max;
+/* Worst blocked-acquire on the NON-game thread (i.e. the audio callback)
+ * since the last [apuprof] report — the direct starvation measure. Running
+ * max, zeroed by the reporter, deliberately NOT by ApuProfFrameReset. */
+uint64_t g_apuprof_audiowait_max_ns;
+const char *g_apuprof_last_port_func;
+
+int ApuProfEnabled(void) {
+  if (g_apuprof < 0) {
+    const char *e = getenv("AR_APUPROF");
+    g_apuprof = (e && e[0] && e[0] != '0') ? 1 : 0;
+  }
+  return g_apuprof;
+}
+
+void ApuProfFrameReset(void) {
+  g_apuprof_lockwait_ns = 0;
+  g_apuprof_catchup_ns = 0;
+  g_apuprof_catchup_cyc = 0;
+  g_apuprof_catchup_calls = 0;
+  g_apuprof_port_reads = 0;
+  g_apuprof_port_writes = 0;
+  g_apuprof_hook_ns = 0;
+  g_apuprof_upload_ns = 0;
+  g_apuprof_sched_lat_max = 0;
+  g_apuprof_last_port_func = NULL;
+}
 
 // FILE-backed SaveLoadInfo. snes_saveload calls back into func() once per
 // scalar/blob; we route each call to fread/fwrite. Single magic+version
@@ -79,8 +129,23 @@ void RtlReset(int mode) {
     memset(g_sram, 0, g_sram_size);
 
   RtlApuLock();
+  s_dsp_resample_phase = 0.0;
   g_spc_player->initialize(g_spc_player);
   RtlApuUnlock();
+}
+
+void RtlSetAudioOutputRate(int hz) {
+  /* SDL's practical range is narrower, but keeping the runner seam generic is
+   * useful to other games. The lower bound also guarantees each 1024-frame
+   * resampling chunk fits in the 8192-frame DSP FIFO. */
+  if (hz < 8000) hz = 8000;
+  if (hz > 384000) hz = 384000;
+  s_audio_output_rate = hz;
+  s_dsp_resample_phase = 0.0;
+}
+
+int RtlGetAudioOutputRate(void) {
+  return s_audio_output_rate;
 }
 
 bool RtlRunFrame(uint32 inputs) {
@@ -293,6 +358,8 @@ uint16 ReadRegWord(uint16 reg) {
     RtlApuLock();
     rtl_accumulate_apu_catchup();
     snes_catchupApu(g_snes);
+    { extern int ApuProfEnabled(void); extern uint32_t g_apuprof_port_reads;
+      if (ApuProfEnabled()) g_apuprof_port_reads++; }
     uint8_t lo = g_snes->apu->outPorts[(reg & 0x3)];
     uint8_t hi = g_snes->apu->outPorts[((reg + 1) & 0x3)];
     RtlApuUnlock();
@@ -458,7 +525,16 @@ void RtlApuWrite(uint16 adr, uint8 val) {
   rtl_accumulate_apu_catchup();
   snes_catchupApu(g_snes);
   audio_trace_on_cpu_port_write((uint8_t)(adr & 0x3), val);
-  if (g_rtl_apu_port_hook)
+  if (ApuProfEnabled()) {
+    extern const char *g_last_recomp_func;
+    g_apuprof_port_writes++;
+    g_apuprof_last_port_func = g_last_recomp_func;
+    if (g_rtl_apu_port_hook) {
+      uint64_t t0 = audio_trace_wall_ns();
+      g_rtl_apu_port_hook((uint8_t)(adr & 0x3), val);
+      g_apuprof_hook_ns += audio_trace_wall_ns() - t0;
+    }
+  } else if (g_rtl_apu_port_hook)
     g_rtl_apu_port_hook((uint8_t)(adr & 0x3), val);
   if (getenv("AR_APULOG") && (adr & 0xfc) == 0x40) {
     extern int snes_frame_counter;
@@ -545,6 +621,10 @@ void RtlApuWrite(uint16 adr, uint8 val) {
 
     s_port_clock = target;
     s_port_clock_ns = now_ns;
+    if (ApuProfEnabled()) {
+      uint64_t lat = target > produced ? target - produced : 0;
+      if (lat > g_apuprof_sched_lat_max) g_apuprof_sched_lat_max = lat;
+    }
     apu_schedulePortWrite(g_snes->apu, (uint8_t)(adr & 0x3), val, target);
   }
   RtlApuUnlock();
@@ -593,6 +673,7 @@ void ar_uploader_complete_tick(void) {
 }
 
 static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_result) {
+  uint64_t prof_t0 = ApuProfEnabled() ? audio_trace_wall_ns() : 0;
   uint16_t dp = (cpu->D + AR_SPC_UPLOAD_DP_PTR) & 0xffff;
   uint16_t data_lo = (uint16_t)g_ram[(dp + 0) & 0xffff]
                    | ((uint16_t)g_ram[(dp + 1) & 0xffff] << 8);
@@ -626,6 +707,7 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
       RtlApuUnlock();
       fprintf(stderr, "[apu] bad SPC upload stream at %02X:%04X\n",
               data_bank, data_lo);
+      if (prof_t0) g_apuprof_upload_ns += audio_trace_wall_ns() - prof_t0;
       return false;
     }
   }
@@ -789,6 +871,7 @@ static bool RtlUploadSpcImageFromDpInternal(CpuState *cpu, bool update_cpu_resul
 
   if (g_rtl_spc_upload_hook)
     g_rtl_spc_upload_hook(((uint32_t)data_bank << 16) | data_lo);
+  if (prof_t0) g_apuprof_upload_ns += audio_trace_wall_ns() - prof_t0;
 
   if (update_cpu_result) {
     cpu->A = (uint16_t)(cpu->A & 0xff00);
@@ -827,6 +910,7 @@ bool RtlHandleSpcUpload(CpuState *cpu) {
 
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   assert(channels == 2);
+  if (!audio_buffer || samples <= 0) return;
   /* Cycle the APU in small batches under the lock, releasing between
    * each so the CPU thread (RtlApuWrite / snes_readBBus) can make
    * progress. Earlier code held RtlApuLock for the entire 17 000-cycle
@@ -841,24 +925,50 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * wait through a full audio batch. apu_cycle is single-threaded
    * regardless -- the lock just serialises access to inPorts/outPorts
    * shared with the CPU thread. */
-  // Ensure at least one block (534 native samples) is available in the
-  // ring, then consume it. The audio thread only produces the shortfall
+  // Ensure enough native samples are available for each output chunk, then
+  // consume according to elapsed host audio time. The audio thread only
+  // produces the shortfall
   // the CPU-thread catch-up (snes_catchupApu) hasn't already supplied, so
   // it self-balances: total SPC advance stays at the consumption rate and
   // bursty catch-up production is buffered, not dropped.
   #define DSP_AVAIL(d) ((uint32_t)((d)->sampleWrite - (d)->sampleRead))
-  while (DSP_AVAIL(g_snes->apu->dsp) < 534) {
-    RtlApuLock();
-    audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
-    int batch = 256;
-    while (batch-- > 0 && DSP_AVAIL(g_snes->apu->dsp) < 534)
-      apu_cycle(g_snes->apu);
-    audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
-    RtlApuUnlock();
+  const double native_step = RTL_DSP_NATIVE_RATE / s_audio_output_rate;
+  int rendered = 0;
+  while (rendered < samples) {
+    int chunk = samples - rendered;
+    if (chunk > RTL_AUDIO_RESAMPLE_CHUNK)
+      chunk = RTL_AUDIO_RESAMPLE_CHUNK;
+    uint32_t needed_for_cursor =
+        (uint32_t)(s_dsp_resample_phase + chunk * native_step) + 1;
+    uint32_t needed_for_interpolation =
+        (uint32_t)(s_dsp_resample_phase + (chunk - 1) * native_step) + 2;
+    uint32_t needed = needed_for_cursor > needed_for_interpolation
+        ? needed_for_cursor : needed_for_interpolation;
+    for (;;) {
+      RtlApuLock();
+      uint32_t available = DSP_AVAIL(g_snes->apu->dsp);
+      if (available < needed) {
+        audio_trace_set_producer(AUDIO_TRACE_PRODUCER_AUDIO);
+        int batch = 256;
+        while (batch-- > 0 && DSP_AVAIL(g_snes->apu->dsp) < needed)
+          apu_cycle(g_snes->apu);
+        audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+        available = DSP_AVAIL(g_snes->apu->dsp);
+      }
+      if (available >= needed) {
+        dsp_getSamplesResampled(g_snes->apu->dsp,
+                                audio_buffer + rendered * 2, chunk,
+                                native_step, &s_dsp_resample_phase);
+        RtlApuUnlock();
+        break;
+      }
+      RtlApuUnlock();
+    }
+    rendered += chunk;
   }
   #undef DSP_AVAIL
+
   RtlApuLock();
-  dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
   /* AR_AUDIODBG: report DSP master volume / mute / peak sample so we can tell
    * whether the engine is producing sound at all (silence = engine not playing
    * vs DSP muted/zero-volume vs samples lost downstream). */
@@ -888,7 +998,7 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
    * unless a pack is armed and a track is playing. Runs under the APU
    * lock we already hold, which serialises it against MSU register
    * writes on the CPU thread (msu1_read/msu1_write take the same lock). */
-  msu1_mix(audio_buffer, samples);
+  msu1_mix(audio_buffer, samples, s_audio_output_rate);
   /* Manifest-driven music replacement (ActRaiser music_replacements.c):
    * streams a host file over the (voice-gated) S-DSP mix. Same lock
    * contract as msu1_mix; NULL for games that don't install it. */
