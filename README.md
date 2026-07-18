@@ -4,6 +4,15 @@
 
 # snesrecomp
 
+> [!IMPORTANT]
+> **ActRaiser development has moved.** This `actraiser-main` branch is retained
+> for historical reference only. The maintained project and source of truth is
+> [DerrickGold/ar-recomp](https://github.com/DerrickGold/ar-recomp), including
+> the current Go recompiler under
+> [`snesrecomp-go`](https://github.com/DerrickGold/ar-recomp/tree/main/snesrecomp-go).
+> New development, builds, integrations, and issue reports for ActRaiser should
+> use that repository.
+
 A static recompiler for SNES (Super Famicom) games. Translates 65816
 machine code into native C ahead-of-time, so the recompiled game runs
 as a normal binary rather than under interpretation.
